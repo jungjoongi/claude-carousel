@@ -1,0 +1,650 @@
+#!/usr/bin/env bash
+# claude-carousel — switch between multiple Claude Code accounts,
+# with automatic rotation when one hits a usage/rate limit.
+#
+# https://github.com/jungjoongi/claude-carousel
+#
+# How it works: Claude Code reads CLAUDE_CONFIG_DIR to decide where its
+# config/session state lives, and (on macOS) which system-keychain slot to
+# use for OAuth tokens. Pointing that env var at a different directory per
+# "profile" gives each profile its own login, with zero extra bookkeeping —
+# Claude Code's own /login flow manages credentials however the OS normally
+# does (keychain on macOS, a local file on Linux).
+#
+# Written in bash 3.2-compatible syntax on purpose: that's still the
+# default /bin/bash on macOS, and this script targets it directly rather
+# than requiring Homebrew bash or zsh.
+
+set -u
+
+VERSION="0.1.0"
+
+DEFAULT_DIR="$HOME/.claude"
+CAROUSEL_HOME="${CAROUSEL_HOME:-$HOME/.claude-carousel}"
+PROFILE_ROOT="$CAROUSEL_HOME/profiles"
+DEFAULT_FILE="$CAROUSEL_HOME/default"
+ORDER_FILE="$CAROUSEL_HOME/order"
+CLAUDE_BIN="${CAROUSEL_CLAUDE_BIN:-claude}"
+OS="$(uname -s)"
+
+# Bypass mode: every run gets --dangerously-skip-permissions, which is what
+# most people juggling several accounts actually want. It is documented in the
+# README as on-by-default. Turn it off for a session or for good with:
+#   export CAROUSEL_BYPASS=0
+BYPASS="${CAROUSEL_BYPASS:-1}"
+
+# Rate-limit detection patterns for `carousel go`. Best-effort and
+# intentionally editable: Claude Code's exact wording can change between
+# versions, so extend this (comma can't appear in the pattern itself) if
+# rotation isn't triggering when it should.
+RATE_LIMIT_PATTERN='usage limit|rate limit|rate-limited|quota exceeded|try again later|limit will reset'
+
+RESERVED_CMDS="ls list add login use switch whoami who sync rm remove order go doctor alias star version help -h --help -v --version"
+
+REPO_SLUG="jungjoongi/claude-carousel"
+ALIAS_FILE="$CAROUSEL_HOME/alias"
+BLOCK_START="# >>> claude-carousel alias >>>"
+BLOCK_END="# <<< claude-carousel alias <<<"
+
+if [ -t 1 ]; then
+  C_B=$'\033[1m'; C_D=$'\033[2m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_R=$'\033[31m'; C_0=$'\033[0m'
+else
+  C_B=''; C_D=''; C_G=''; C_Y=''; C_R=''; C_0=''
+fi
+
+die()  { printf '%serror:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+warn() { printf '%swarning:%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+
+prompt_read() {
+  # echoes one line of user input. Prefers the real terminal so prompts still
+  # work under `curl … | bash`, and falls back to stdin when there's no tty.
+  local ans=""
+  if { : < /dev/tty; } 2>/dev/null; then
+    read -r ans < /dev/tty || true
+  else
+    read -r ans || true
+  fi
+  printf '%s\n' "$ans"
+}
+
+is_reserved() {
+  local w
+  for w in $RESERVED_CMDS; do [ "$w" = "$1" ] && return 0; done
+  return 1
+}
+
+abspath() {
+  # portable stand-in for zsh's ${var:A} / GNU readlink -f
+  if [ -d "$1" ]; then (cd "$1" 2>/dev/null && pwd -P)
+  else printf '%s\n' "$1"
+  fi
+}
+
+profile_dir() {
+  if [ "$1" = "default" ]; then printf '%s\n' "$DEFAULT_DIR"
+  else printf '%s\n' "$PROFILE_ROOT/$1"
+  fi
+}
+
+profile_exists() {
+  [ "$1" = "default" ] && return 0
+  [ -d "$PROFILE_ROOT/$1" ]
+}
+
+list_profiles() {
+  printf '%s\n' default
+  [ -d "$PROFILE_ROOT" ] || return 0
+  local d
+  for d in "$PROFILE_ROOT"/*/; do
+    [ -d "$d" ] || continue
+    basename "$d"
+  done
+}
+
+get_default() {
+  if [ -f "$DEFAULT_FILE" ]; then
+    local n; n=$(cat "$DEFAULT_FILE" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$n" ] && profile_exists "$n"; then printf '%s\n' "$n"; return; fi
+  fi
+  printf '%s\n' default
+}
+
+get_order() {
+  if [ -f "$ORDER_FILE" ]; then
+    cat "$ORDER_FILE"
+  else
+    list_profiles
+  fi
+}
+
+config_json() {
+  local dir="$1"
+  if [ "$(abspath "$dir")" = "$(abspath "$DEFAULT_DIR")" ]; then
+    printf '%s\n' "$HOME/.claude.json"
+  else
+    printf '%s\n' "$dir/.claude.json"
+  fi
+}
+
+profile_email() {
+  local cfg; cfg=$(config_json "$1")
+  [ -f "$cfg" ] || { printf '%s\n' "-"; return; }
+  python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("-"); raise SystemExit
+a = d.get("oauthAccount") or {}
+print(a.get("emailAddress") or "(not logged in)")
+' "$cfg" 2>/dev/null || printf '%s\n' "-"
+}
+
+# --- shared-asset sync ------------------------------------------------------
+SHARED_DIRS="plugins skills projects"
+SHARED_FILES="settings.json settings.local.json mcp.json CLAUDE.md"
+
+sync_profile() {
+  local name="$1" dir; dir=$(profile_dir "$name")
+  [ "$name" = "default" ] && return 0
+  [ -d "$dir" ] || die "profile '$name' does not exist. Run: carousel add $name"
+
+  local item target
+  for item in $SHARED_DIRS; do
+    [ -e "$DEFAULT_DIR/$item" ] || continue
+    target="$dir/$item"
+    if [ -L "$target" ]; then
+      [ "$(readlink "$target")" = "$DEFAULT_DIR/$item" ] && continue
+      rm -f "$target"
+    elif [ -e "$target" ]; then
+      warn "$name/$item is a real directory (not a symlink) — leaving it alone"
+      continue
+    fi
+    ln -sfn "$DEFAULT_DIR/$item" "$target"
+  done
+
+  for item in $SHARED_FILES; do
+    [ -f "$DEFAULT_DIR/$item" ] || continue
+    target="$dir/$item"
+    if [ ! -f "$target" ] || ! cmp -s "$DEFAULT_DIR/$item" "$target"; then
+      cp -p "$DEFAULT_DIR/$item" "$target"
+    fi
+  done
+}
+
+# --- subcommands -------------------------------------------------------------
+cmd_add() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: carousel add <name>"
+  [ "$name" = "default" ] && die "'default' is reserved for your existing ~/.claude"
+  case "$name" in .*|*/*) die "profile name can't start with '.' or contain '/'";; esac
+  is_reserved "$name" && die "'$name' is a reserved command name, pick another"
+
+  local dir="$PROFILE_ROOT/$name"
+  [ -d "$dir" ] && die "profile '$name' already exists"
+
+  mkdir -p "$dir"
+  sync_profile "$name"
+  printf '%s✓%s profile %s%s%s created: %s\n' "$C_G" "$C_0" "$C_B" "$name" "$C_0" "$dir"
+  printf '\nNext: %scarousel login %s%s\n' "$C_B" "$name" "$C_0"
+}
+
+cmd_login() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: carousel login <name>"
+  profile_exists "$name" || die "profile '$name' does not exist. Run: carousel add $name"
+  sync_profile "$name"
+  printf 'Opening Claude Code for profile %s%s%s. Follow the login flow if prompted.\n' "$C_B" "$name" "$C_0"
+  if [ "$name" = "default" ]; then
+    exec env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN"
+  else
+    CLAUDE_CONFIG_DIR="$(profile_dir "$name")" exec "$CLAUDE_BIN"
+  fi
+}
+
+has_permission_flag() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --dangerously-skip-permissions|--permission-mode|--permission-mode=*|--allow-dangerously-skip-permissions)
+        return 0 ;;
+    esac
+  done
+  return 1
+}
+
+cmd_run() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then name=$(get_default); else shift; fi
+  profile_exists "$name" || die "profile '$name' does not exist. See: carousel ls"
+  sync_profile "$name"
+
+  local extra=""
+  if [ "$BYPASS" = "1" ] && ! has_permission_flag "$@"; then
+    extra="--dangerously-skip-permissions"
+  fi
+
+  if [ "$name" = "default" ]; then
+    # shellcheck disable=SC2086
+    exec env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN" $extra "$@"
+  else
+    # shellcheck disable=SC2086
+    CLAUDE_CONFIG_DIR="$(profile_dir "$name")" exec "$CLAUDE_BIN" $extra "$@"
+  fi
+}
+
+cmd_ls() {
+  local def; def=$(get_default)
+  printf '%s  %-14s %-30s %s\n' " " "PROFILE" "ACCOUNT" "CLAUDE_CONFIG_DIR"
+  printf '%s  %-14s %-30s %s\n' " " "--------------" "------------------------------" "------------------"
+  local name dir email label
+  list_profiles | while IFS= read -r name; do
+    dir=$(profile_dir "$name")
+    email=$(profile_email "$dir")
+    label="$name"
+    [ "$name" = "$def" ] && label="$name *"
+    printf '   %-14s %-30s %s\n' "$label" "$email" "$dir"
+  done
+  printf '\n%s*%s = default profile (used when you run "carousel" with no name)\n' "$C_Y" "$C_0"
+}
+
+cmd_use() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: carousel use <name>"
+  profile_exists "$name" || die "profile '$name' does not exist"
+  mkdir -p "$CAROUSEL_HOME"
+  printf '%s\n' "$name" > "$DEFAULT_FILE"
+  printf '%s✓%s default profile set to %s%s%s\n' "$C_G" "$C_0" "$C_B" "$name" "$C_0"
+}
+
+cmd_whoami() {
+  local dir="${CLAUDE_CONFIG_DIR:-$DEFAULT_DIR}" name="" p pd
+  list_profiles | while IFS= read -r p; do
+    pd=$(profile_dir "$p")
+    if [ "$(abspath "$pd")" = "$(abspath "$dir")" ]; then
+      printf 'profile: %s\n' "$p"
+      printf 'path   : %s\n' "$dir"
+      printf 'account: %s\n' "$(profile_email "$pd")"
+      return
+    fi
+  done
+}
+
+cmd_sync() {
+  local name="${1:-}"
+  if [ -n "$name" ]; then
+    sync_profile "$name"
+    printf '%s✓%s %s\n' "$C_G" "$C_0" "$name"
+  else
+    list_profiles | while IFS= read -r name; do
+      [ "$name" = "default" ] && continue
+      sync_profile "$name"
+      printf '%s✓%s %s\n' "$C_G" "$C_0" "$name"
+    done
+  fi
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: carousel rm <name>"
+  [ "$name" = "default" ] && die "'default' points at your real ~/.claude — nothing to remove"
+  local dir="$PROFILE_ROOT/$name"
+  [ -d "$dir" ] || die "profile '$name' does not exist"
+  printf 'Removing: %s\n' "$dir"
+  printf '%s(only the symlinks are unlinked — your real plugins/projects are untouched)%s\n' "$C_D" "$C_0"
+  printf 'Proceed? [y/N] '
+  read -r ans
+  case "$ans" in y|Y|yes|YES) ;; *) printf 'cancelled\n'; return;; esac
+  local item
+  for item in $SHARED_DIRS; do [ -L "$dir/$item" ] && rm -f "$dir/$item"; done
+  rm -rf "$dir"
+  printf '%s✓%s removed\n' "$C_G" "$C_0"
+}
+
+cmd_order() {
+  if [ "$#" -eq 0 ]; then
+    printf 'rotation order used by "carousel go":\n'
+    get_order | nl -ba -w2 -s'. '
+    return
+  fi
+  mkdir -p "$CAROUSEL_HOME"
+  : > "$ORDER_FILE"
+  local n
+  for n in "$@"; do
+    profile_exists "$n" || die "profile '$n' does not exist"
+    printf '%s\n' "$n" >> "$ORDER_FILE"
+  done
+  printf '%s✓%s rotation order set: %s\n' "$C_G" "$C_0" "$*"
+}
+
+# --- rotation-aware run ("go") ------------------------------------------------
+pty_available() {
+  # `script` needs a real controlling terminal. Inside CI, some editor
+  # terminals, or anything that hands us a socket for stdin, it bails out with
+  # "tcgetattr/ioctl: Operation not supported on socket" — probe for that so we
+  # can degrade gracefully instead of failing the run.
+  case "$OS" in
+    Darwin) script -q /dev/null true >/dev/null 2>&1 ;;
+    *)      script -qc true /dev/null >/dev/null 2>&1 ;;
+  esac
+}
+
+run_captured() {
+  # runs claude through a pty so a full-screen TUI app's output is actually
+  # capturable, echoing to the terminal and recording to $log at the same time
+  local name="$1" log="$2"; shift 2
+  local dir
+  if [ "$name" = "default" ]; then dir=""; else dir="$(profile_dir "$name")"; fi
+
+  local extra=""
+  if [ "$BYPASS" = "1" ] && ! has_permission_flag "$@"; then
+    extra="--dangerously-skip-permissions"
+  fi
+
+  case "$OS" in
+    Darwin)
+      if [ -n "$dir" ]; then
+        CLAUDE_CONFIG_DIR="$dir" script -q "$log" "$CLAUDE_BIN" $extra "$@"
+      else
+        env -u CLAUDE_CONFIG_DIR script -q "$log" "$CLAUDE_BIN" $extra "$@"
+      fi
+      ;;
+    *)
+      if [ -n "$dir" ]; then
+        CLAUDE_CONFIG_DIR="$dir" script -qc "$CLAUDE_BIN $extra $*" "$log"
+      else
+        env -u CLAUDE_CONFIG_DIR script -qc "$CLAUDE_BIN $extra $*" "$log"
+      fi
+      ;;
+  esac
+}
+
+cmd_go() {
+  command -v script >/dev/null 2>&1 || die "'carousel go' needs the 'script' utility (present by default on macOS and most Linux distros)"
+
+  if ! pty_available; then
+    warn "no usable pty here, so rate-limit detection is off — running the default profile directly"
+    cmd_run "$@"
+    return $?
+  fi
+
+  local order_list; order_list=$(get_order)
+  [ -n "$order_list" ] || die "no profiles to rotate through. Run: carousel add <name>"
+
+  local cur; cur=$(get_default)
+  local -a order=()
+  while IFS= read -r l; do order+=("$l"); done <<EOF
+$order_list
+EOF
+
+  local n=${#order[@]}
+  local start_idx=0 i
+  for i in "${!order[@]}"; do
+    [ "${order[$i]}" = "$cur" ] && { start_idx=$i; break; }
+  done
+
+  local tries=0
+  while [ "$tries" -lt "$n" ]; do
+    local idx=$(( (start_idx + tries) % n ))
+    local name="${order[$idx]}"
+    if ! profile_exists "$name"; then tries=$((tries + 1)); continue; fi
+
+    printf '%s▶ running as %s%s\n' "$C_B" "$name" "$C_0"
+    sync_profile "$name"
+    local log; log=$(mktemp "${TMPDIR:-/tmp}/carousel.XXXXXX")
+    run_captured "$name" "$log" "$@"
+    local exit_code=$?
+
+    if grep -qiE "$RATE_LIMIT_PATTERN" "$log" 2>/dev/null; then
+      rm -f "$log"
+      tries=$((tries + 1))
+      if [ "$tries" -ge "$n" ]; then
+        printf '%s✗%s every profile in rotation looks rate-limited\n' "$C_R" "$C_0" >&2
+        return 1
+      fi
+      local next="${order[$(( (start_idx + tries) % n ))]}"
+      printf '%s⚠ rate limit detected on %s — switching to %s in 2s (Ctrl-C to stop)%s\n' "$C_Y" "$name" "$next" "$C_0"
+      sleep 2
+      continue
+    fi
+
+    rm -f "$log"
+    return "$exit_code"
+  done
+}
+
+# --- shell alias management --------------------------------------------------
+detect_rc() {
+  case "$(basename "${SHELL:-sh}")" in
+    zsh)  printf '%s\n' "$HOME/.zshrc" ;;
+    bash) if [ -f "$HOME/.bashrc" ]; then printf '%s\n' "$HOME/.bashrc"
+          else printf '%s\n' "$HOME/.bash_profile"; fi ;;
+    fish) printf '%s\n' "$HOME/.config/fish/config.fish" ;;
+    *)    printf '%s\n' "$HOME/.profile" ;;
+  esac
+}
+
+remove_managed_block() {
+  local rc="$1" tmp
+  [ -f "$rc" ] || return 0
+  tmp="$(mktemp)"
+  awk -v s="$BLOCK_START" -v e="$BLOCK_END" '
+    $0 == s { skip = 1; next }
+    $0 == e { skip = 0; next }
+    skip != 1 { print }
+  ' "$rc" > "$tmp" && cat "$tmp" > "$rc"
+  rm -f "$tmp"
+}
+
+write_managed_block() {
+  local rc="$1" name="$2"
+  mkdir -p "$(dirname "$rc")"
+  remove_managed_block "$rc"
+  {
+    printf '%s\n' "$BLOCK_START"
+    printf "alias %s='carousel'\n" "$name"
+    printf '%s\n' "$BLOCK_END"
+  } >> "$rc"
+}
+
+# an `alias <name>=` line that we did not write ourselves
+find_foreign_alias() {
+  local name="$1" rc="$2"
+  [ -f "$rc" ] || return 1
+  awk -v s="$BLOCK_START" -v e="$BLOCK_END" -v n="$name" '
+    $0 == s { skip = 1; next }
+    $0 == e { skip = 0; next }
+    skip == 1 { next }
+    $0 ~ "^[[:space:]]*alias[[:space:]]+" n "=" { print NR ": " $0; found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$rc"
+}
+
+comment_out_foreign_alias() {
+  local name="$1" rc="$2" tmp
+  tmp="$(mktemp)"
+  awk -v s="$BLOCK_START" -v e="$BLOCK_END" -v n="$name" '
+    $0 == s { inblock = 1; print; next }
+    $0 == e { inblock = 0; print; next }
+    inblock == 0 && $0 ~ "^[[:space:]]*alias[[:space:]]+" n "=" {
+      print "# " $0 "  # disabled by claude-carousel"
+      next
+    }
+    { print }
+  ' "$rc" > "$tmp" && cat "$tmp" > "$rc"
+  rm -f "$tmp"
+}
+
+cmd_alias() {
+  local assume_yes=0 name=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -y|--yes)   assume_yes=1 ;;
+      --remove)   name="--remove" ;;
+      -*)         die "unknown option: $1" ;;
+      *)          name="$1" ;;
+    esac
+    shift
+  done
+
+  local rc; rc="$(detect_rc)"
+
+  # no argument: report what's registered
+  if [ -z "$name" ]; then
+    if [ -f "$ALIAS_FILE" ]; then
+      printf 'alias    : %s -> carousel\n' "$(cat "$ALIAS_FILE")"
+    else
+      printf 'alias    : (none registered)\n'
+    fi
+    printf 'shell rc : %s\n' "$rc"
+    printf '\nSet one with:  carousel alias <name>       (e.g. carousel alias cc)\nRemove it with: carousel alias --remove\n'
+    return 0
+  fi
+
+  if [ "$name" = "--remove" ]; then
+    remove_managed_block "$rc"
+    rm -f "$ALIAS_FILE"
+    printf '%s✓%s alias removed from %s (restart your shell to apply)\n' "$C_G" "$C_0" "$rc"
+    return 0
+  fi
+
+  case "$name" in
+    *[!a-zA-Z0-9_-]*) die "'$name' isn't a usable alias name (letters, digits, _ and - only)" ;;
+  esac
+  [ "$name" = "carousel" ] && die "that's already the command name"
+
+  # conflict 1: an alias someone else defined in the rc
+  local foreign; foreign="$(find_foreign_alias "$name" "$rc" 2>/dev/null || true)"
+  if [ -n "$foreign" ]; then
+    printf '%s!%s %s already has an alias named "%s":\n' "$C_Y" "$C_0" "$rc" "$name"
+    printf '    %s\n' "$foreign"
+    if [ "$assume_yes" = "1" ]; then
+      comment_out_foreign_alias "$name" "$rc"
+      printf '%s✓%s commented the old line out\n' "$C_G" "$C_0"
+    else
+      printf 'Comment it out and take over "%s"? [y/N] ' "$name"
+      local ans; ans="$(prompt_read)"
+      case "$ans" in
+        y|Y|yes|YES) comment_out_foreign_alias "$name" "$rc"
+                     printf '%s✓%s commented the old line out\n' "$C_G" "$C_0" ;;
+        *)           printf 'Left it alone — pick another name and run: carousel alias <name>\n'
+                     return 1 ;;
+      esac
+    fi
+  fi
+
+  # conflict 2: a real binary of the same name (cc, ls, ...)
+  local existing; existing="$(command -v "$name" 2>/dev/null || true)"
+  case "$existing" in
+    ""|*"alias"*) ;;
+    *) printf '%s!%s "%s" is also a real command at %s.\n' "$C_Y" "$C_0" "$name" "$existing"
+       printf '  A shell alias only shadows it when you type it interactively —\n'
+       printf '  scripts and Makefiles calling %s keep using %s.\n' "$name" "$existing" ;;
+  esac
+
+  write_managed_block "$rc" "$name"
+  mkdir -p "$CAROUSEL_HOME"
+  printf '%s\n' "$name" > "$ALIAS_FILE"
+  printf '%s✓%s "%s" now runs carousel (added to %s)\n' "$C_G" "$C_0" "$name" "$rc"
+  printf '  Apply it now with:  source %s\n' "$rc"
+}
+
+# --- star the repo (explicit opt-in only) ------------------------------------
+cmd_star() {
+  command -v gh >/dev/null 2>&1 || {
+    printf 'The GitHub CLI (gh) is not installed. You can star it in a browser instead:\n'
+    printf '  https://github.com/%s\n' "$REPO_SLUG"
+    return 1
+  }
+  gh auth status >/dev/null 2>&1 || {
+    printf 'gh is installed but not logged in. Run "gh auth login" first, or star it here:\n'
+    printf '  https://github.com/%s\n' "$REPO_SLUG"
+    return 1
+  }
+  if gh api -X PUT "user/starred/$REPO_SLUG" >/dev/null 2>&1; then
+    printf '%s★%s thanks! starred %s\n' "$C_Y" "$C_0" "$REPO_SLUG"
+  else
+    printf 'Could not star it automatically. Here it is in a browser:\n'
+    printf '  https://github.com/%s\n' "$REPO_SLUG"
+    return 1
+  fi
+}
+
+cmd_doctor() {
+  printf 'carousel      : %s\n' "$VERSION"
+  printf 'OS            : %s\n' "$OS"
+  printf 'shell         : %s\n' "${BASH_VERSION:+bash $BASH_VERSION}"
+  printf 'claude binary : %s\n' "$(command -v "$CLAUDE_BIN" 2>/dev/null || echo 'NOT FOUND on PATH')"
+  printf 'script utility: %s\n' "$(command -v script 2>/dev/null || echo 'NOT FOUND (carousel go will not work)')"
+  case "$OS" in
+    Darwin) printf 'credentials   : macOS Keychain, per CLAUDE_CONFIG_DIR (handled automatically)\n' ;;
+    *)      printf 'credentials   : a local file under each profile'\''s CLAUDE_CONFIG_DIR (handled automatically by Claude Code itself)\n' ;;
+  esac
+  printf 'carousel home : %s\n' "$CAROUSEL_HOME"
+  printf 'bypass mode   : %s (--dangerously-skip-permissions; set CAROUSEL_BYPASS=0 to turn off)\n' "$([ "$BYPASS" = "1" ] && echo on || echo off)"
+}
+
+usage_row() {
+  # $1 command, $2 column width, $3 description
+  printf '  %s%-*s%s %s\n' "$C_B" "$2" "$1" "$C_0" "$3"
+}
+
+usage() {
+  # show the alias the user actually registered, so the help matches what they type
+  local me="carousel"
+  if [ -f "$ALIAS_FILE" ]; then
+    me="$(cat "$ALIAS_FILE" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$me" ] || me="carousel"
+  fi
+  local w=$(( ${#me} + 18 ))
+
+  printf '%sclaude-carousel%s — switch between multiple Claude Code accounts\n\n' "$C_B" "$C_0"
+  usage_row "$me ls"              "$w" "list profiles"
+  usage_row "$me add <name>"      "$w" "create a new profile"
+  usage_row "$me login <name>"    "$w" "log in to a profile (first-time setup)"
+  usage_row "$me <name> [args...]" "$w" "run Claude Code as that profile"
+  usage_row "$me"                 "$w" "run the default profile"
+  usage_row "$me use <name>"      "$w" "set the default profile"
+  usage_row "$me whoami"          "$w" "show which profile the current shell is in"
+  usage_row "$me order [names...]" "$w" "view/set the rotation order for \"go\""
+  usage_row "$me go [args...]"     "$w" "run, auto-rotating to the next profile if"
+  usage_row ""                    "$w" "the current one looks rate-limited"
+  usage_row "$me sync [name]"     "$w" "re-sync shared plugins/settings from ~/.claude"
+  usage_row "$me rm <name>"       "$w" "remove a profile"
+  usage_row "$me alias [name]"    "$w" "register/change a short shell alias (--remove to undo)"
+  usage_row "$me star"            "$w" "star the repo, if you find this useful"
+  usage_row "$me doctor"          "$w" "environment / troubleshooting info"
+  usage_row "$me version"         "$w" "print the version"
+
+
+  if [ "$me" = "carousel" ]; then
+    printf '\nTyping "carousel" gets old — "carousel alias cc" makes "cc go" work.\n'
+  fi
+
+  cat <<EOF
+
+Your existing Claude Code login is always available as the "default" profile —
+nothing to migrate, no re-login needed for the account you already use.
+
+Bypass mode (--dangerously-skip-permissions) is ON by default. Turn it off with:
+  export CAROUSEL_BYPASS=0
+EOF
+}
+
+case "${1:-}" in
+  ls|list)      shift; cmd_ls "$@" ;;
+  add)          shift; cmd_add "$@" ;;
+  login)        shift; cmd_login "$@" ;;
+  use|switch)   shift; cmd_use "$@" ;;
+  whoami|who)   shift; cmd_whoami "$@" ;;
+  sync)         shift; cmd_sync "$@" ;;
+  rm|remove)    shift; cmd_rm "$@" ;;
+  order)        shift; cmd_order "$@" ;;
+  go)           shift; cmd_go "$@" ;;
+  doctor)       shift; cmd_doctor "$@" ;;
+  version|-v|--version) printf 'claude-carousel %s\n' "$VERSION" ;;
+  alias)        shift; cmd_alias "$@" ;;
+  star)         shift; cmd_star "$@" ;;
+  help|-h|--help) usage ;;
+  *)            cmd_run "$@" ;;
+esac

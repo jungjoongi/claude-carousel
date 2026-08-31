@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 380" width="1200" height="380" role="img" aria-label="claude-carousel — run several Claude Code accounts side by side, and auto-rotate when a usage limit hits">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#12151c"/>
+      <stop offset="55%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="canopy" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#d97757"/>
+      <stop offset="100%" stop-color="#e9a03b"/>
+    </linearGradient>
+    <clipPath id="canopyClip">
+      <path d="M -58 2 Q -46 -34 0 -50 Q 46 -34 58 2 Z"/>
+    </clipPath>
+    <style>
+      .mono { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="380" rx="18" fill="url(#bg)"/>
+  <rect x="0.5" y="0.5" width="1199" height="379" rx="18" fill="none" stroke="#30363d"/>
+
+  <!-- carousel: canopy + post + three seats orbiting -->
+  <g transform="translate(104 158)">
+    <!-- back half of the orbit -->
+    <path d="M -60 26 A 60 18 0 0 1 60 26" fill="none" stroke="#30363d" stroke-width="2"/>
+
+    <!-- center post -->
+    <path d="M0 -44 L0 26" stroke="#484f58" stroke-width="3.5" stroke-linecap="round"/>
+
+    <!-- hangers -->
+    <path d="M-46 -6 L-53 20" stroke="#484f58" stroke-width="1.6"/>
+    <path d="M46 -6 L53 20" stroke="#484f58" stroke-width="1.6"/>
+    <path d="M0 -2 L0 40" stroke="#484f58" stroke-width="1.6"/>
+
+    <!-- canopy -->
+    <path d="M -58 2 Q -46 -34 0 -50 Q 46 -34 58 2" fill="url(#canopy)"/>
+    <g clip-path="url(#canopyClip)" opacity="0.28">
+      <path d="M0 -50 L -30 4" stroke="#0d1117" stroke-width="9"/>
+      <path d="M0 -50 L 30 4" stroke="#0d1117" stroke-width="9"/>
+    </g>
+    <!-- scalloped rim -->
+    <path d="M -58 2
+             a 9.7 8 0 0 0 19.3 0 a 9.7 8 0 0 0 19.3 0
+             a 9.7 8 0 0 0 19.3 0 a 9.7 8 0 0 0 19.3 0
+             a 9.7 8 0 0 0 19.3 0 a 9.7 8 0 0 0 19.3 0"
+          fill="none" stroke="url(#canopy)" stroke-width="3.5" stroke-linecap="round"/>
+    <circle cx="0" cy="-54" r="4.5" fill="#e9a03b"/>
+
+    <!-- seats -->
+    <circle cx="-53" cy="20" r="12" fill="#d97757"/>
+    <circle cx="53" cy="20" r="12" fill="#3fb950" opacity="0.85"/>
+    <circle cx="0" cy="40" r="12" fill="#5b8def"/>
+
+    <!-- front half of the orbit + spin arrow -->
+    <path d="M -60 26 A 60 18 0 0 0 42 40" fill="none" stroke="#6e7681" stroke-width="2" stroke-linecap="round"/>
+    <path d="M42 40 l -9.5 -3.5 l 2.5 8.5 z" fill="#6e7681"/>
+  </g>
+
+  <text class="sans" x="196" y="112" font-size="46" font-weight="700" fill="#e6edf3">claude-carousel</text>
+  <text class="sans" x="196" y="150" font-size="19.5" fill="#8b949e">Run several Claude Code accounts side by side —</text>
+  <text class="sans" x="196" y="177" font-size="19.5" fill="#8b949e">and keep working when one hits its usage limit.</text>
+
+  <g class="sans" font-size="14.5" fill="#6e7681">
+    <text x="196" y="228">◆  one bash script, zero dependencies</text>
+    <text x="196" y="254">◆  your current login already works, nothing to migrate</text>
+    <text x="196" y="280">◆  never touches your tokens — Claude Code keeps handling those</text>
+    <text x="196" y="306">◆  auto-rotates accounts on a rate limit</text>
+  </g>
+
+  <!-- terminal mock -->
+  <g transform="translate(672 64)">
+    <rect width="452" height="252" rx="11" fill="#010409" stroke="#30363d"/>
+    <path d="M0 11 a11 11 0 0 1 11 -11 h430 a11 11 0 0 1 11 11 v23 h-452 z" fill="#161b22"/>
+    <circle cx="20" cy="17" r="5.5" fill="#f85149"/>
+    <circle cx="39" cy="17" r="5.5" fill="#e9a03b"/>
+    <circle cx="58" cy="17" r="5.5" fill="#3fb950"/>
+    <text class="mono" x="226" y="21" font-size="11.5" fill="#6e7681" text-anchor="middle">cc — alias for carousel</text>
+
+    <g class="mono" font-size="13">
+      <text x="20" y="66" fill="#3fb950">$</text>
+      <text x="36" y="66" fill="#e6edf3">cc go</text>
+
+      <text x="20" y="100" fill="#e6edf3">▶ running as</text>
+      <text x="121" y="100" fill="#5b8def">default</text>
+
+      <text x="20" y="134" fill="#e9a03b">⚠ rate limit detected</text>
+      <text x="20" y="156" fill="#8b949e">  switching to</text>
+      <text x="128" y="156" fill="#d97757">work</text>
+      <text x="171" y="156" fill="#8b949e">in 2s…</text>
+
+      <text x="20" y="190" fill="#e6edf3">▶ running as</text>
+      <text x="121" y="190" fill="#d97757">work</text>
+
+      <text x="20" y="224" fill="#3fb950">✓</text>
+      <text x="36" y="224" fill="#8b949e">back to work, same terminal</text>
+    </g>
+  </g>
+</svg>
