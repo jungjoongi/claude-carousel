@@ -65,12 +65,12 @@ if [ -n "$alias_name" ]; then
   printf '\n'
 fi
 
-# --- optional star (explicit opt-in, never automatic) --------------------------
+# --- optional star (prompted, Enter accepts; never automatic) ------------------
 if [ "$NO_PROMPT" != "1" ] && have_tty; then
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    printf 'Star %s on GitHub? It helps other people find it. [y/N] ' "$REPO_SLUG"
+    printf 'Star %s on GitHub? It helps other people find it. [Y/n] ' "$REPO_SLUG"
     case "$(ask)" in
-      y|Y|yes|YES) "$TARGET" star || true ;;
+      ''|y|Y|yes|YES) "$TARGET" star || true ;;
       *) printf 'No problem — "carousel star" any time you change your mind.\n' ;;
     esac
     printf '\n'
