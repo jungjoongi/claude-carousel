@@ -93,6 +93,7 @@ cc go                  # 运行；触及上限就自动换下一个账号
 | `cc login <名称>` | 为该配置执行 Claude Code 登录流程 |
 | `cc <名称> [参数…]` | 以该配置运行 Claude Code（额外参数原样传递） |
 | `cc` | 以默认配置运行 |
+| `cc [claude 参数…]` | 以默认配置运行 —— `-` 开头的参数一律交给 `claude` |
 | `cc use <名称>` | 设置默认配置 |
 | `cc whoami` | 查看当前 shell 处于哪个配置 |
 | `cc order [名称…]` | 查看或设置轮换顺序 |
@@ -101,6 +102,9 @@ cc go                  # 运行；触及上限就自动换下一个账号
 | `cc rm <名称>` | 删除配置（只解除软链接，原文件不动） |
 | `cc alias [名称]` | 注册或修改简短的 shell 别名（`--remove` 撤销） |
 | `cc doctor` | 环境与排查信息 |
+| `cc update` | 立即更新 carousel（每天也会自动更新一次） |
+| `cc help` | carousel 自己的帮助（`cc --help` 是 Claude Code 的） |
+| `cc version` | carousel 自己的版本（`cc --version` 是 Claude Code 的） |
 
 ## 更短的别名
 
@@ -184,6 +188,46 @@ export CAROUSEL_BYPASS=0
 
 你自己传入的 `--permission-mode …` 或 skip 参数始终优先于该设置。
 
+## 向 Claude Code 传递参数
+
+carousel 不认识的参数会原样交给 `claude`，你惯用的那些 flag 依旧可用：
+
+```bash
+cc --resume                 # 以默认配置执行 claude --resume
+cc -p "总结一下这个仓库"      # claude -p "…"
+cc work --model opus        # 以 "work" 配置
+cc go --resume              # 带 rate limit 轮换
+```
+
+没有例外：**以 `-` 开头的一律属于 Claude Code。** carousel 的命令全是以空格分隔的普通词，
+两者不会冲突。
+
+```bash
+cc --help        # claude 的帮助
+cc help          # carousel 的帮助
+cc --version     # claude 的版本
+cc version       # carousel 的版本
+```
+
+## 保持最新
+
+carousel 只有一个文件，所谓更新就是把它重新下载一次。通过 carousel 启动 Claude Code 时，
+它每天最多检查一次 GitHub 上的新版本，原子地替换自身，然后照原样重跑你输入的命令。只有发生
+更新时才会打印一行：
+
+```console
+$ cc
+✓ carousel updated 0.2.0 → 0.3.0
+```
+
+除非下载到的确实是一份语法有效的 carousel 脚本，否则不会替换。没有终端时（CI、脚本里的
+`cc -p …`）、carousel 是软链接时、或从 git clone 里运行时，会直接跳过检查。`cc update` 立即
+检查一次，`cc doctor` 显示当前状态。
+
+```bash
+export CAROUSEL_NO_UPDATE=1   # 从不检查
+```
+
 ## 配置项
 
 | 环境变量 | 默认值 | 用途 |
@@ -191,6 +235,8 @@ export CAROUSEL_BYPASS=0
 | `CAROUSEL_BYPASS` | `1` | 设为 `0` 时保留 Claude Code 的正常权限提示 |
 | `CAROUSEL_HOME` | `~/.claude-carousel` | 配置与设置的存放位置 |
 | `CAROUSEL_CLAUDE_BIN` | `claude` | `claude` 可执行文件的路径 |
+| `CAROUSEL_NO_UPDATE` | `0` | 设为 `1` 时关闭每日自动更新检查 |
+| `CAROUSEL_UPDATE_INTERVAL` | `86400` | 更新检查的间隔（秒） |
 
 ## 许可证
 

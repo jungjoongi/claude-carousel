@@ -17,7 +17,7 @@
 
 set -u
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 DEFAULT_DIR="$HOME/.claude"
 CAROUSEL_HOME="${CAROUSEL_HOME:-$HOME/.claude-carousel}"
@@ -39,10 +39,22 @@ BYPASS="${CAROUSEL_BYPASS:-1}"
 # rotation isn't triggering when it should.
 RATE_LIMIT_PATTERN='usage limit|rate limit|rate-limited|quota exceeded|try again later|limit will reset'
 
-RESERVED_CMDS="ls list add login use switch whoami who sync rm remove order go doctor alias star version help -h --help -v --version"
+RESERVED_CMDS="ls list add login use switch whoami who sync rm remove order go doctor alias star update version help"
 
 REPO_SLUG="jungjoongi/claude-carousel"
 ALIAS_FILE="$CAROUSEL_HOME/alias"
+
+# Self-update. carousel is a single file fetched from raw.githubusercontent, so
+# updating is "download it again and rename it into place". The check runs at
+# most once a day, only on the paths that launch Claude Code, and only when
+# there is a terminal to report to.
+#   CAROUSEL_NO_UPDATE=1        never check
+#   CAROUSEL_UPDATE_INTERVAL=n  seconds between checks (default 86400)
+#   CAROUSEL_UPDATE_URL=...     where to fetch from (override is for testing)
+NO_UPDATE="${CAROUSEL_NO_UPDATE:-0}"
+UPDATE_INTERVAL="${CAROUSEL_UPDATE_INTERVAL:-86400}"
+UPDATE_URL="${CAROUSEL_UPDATE_URL:-https://raw.githubusercontent.com/$REPO_SLUG/main/bin/carousel}"
+UPDATE_STAMP="$CAROUSEL_HOME/last-update-check"
 BLOCK_START="# >>> claude-carousel alias >>>"
 BLOCK_END="# <<< claude-carousel alias <<<"
 
@@ -172,12 +184,149 @@ sync_profile() {
   done
 }
 
+# --- self-update ---------------------------------------------------------------
+self_path() {
+  case "$0" in
+    /*)  printf '%s\n' "$0" ;;
+    */*) printf '%s/%s\n' "$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)" "$(basename "$0")" ;;
+    *)   command -v "$0" 2>/dev/null || printf '%s\n' "$0" ;;
+  esac
+}
+
+version_gt() {
+  # $1 > $2 as a dotted numeric version. Pure bash so it works with BSD tools,
+  # where `sort -V` can't be relied on.
+  local a="$1" b="$2" x y
+  while [ -n "$a" ] || [ -n "$b" ]; do
+    x="${a%%.*}"; y="${b%%.*}"
+    case "$a" in *.*) a="${a#*.}" ;; *) a="" ;; esac
+    case "$b" in *.*) b="${b#*.}" ;; *) b="" ;; esac
+    x=$(printf '%s' "${x:-0}" | tr -cd '0-9'); [ -n "$x" ] || x=0
+    y=$(printf '%s' "${y:-0}" | tr -cd '0-9'); [ -n "$y" ] || y=0
+    [ "$x" -gt "$y" ] && return 0
+    [ "$x" -lt "$y" ] && return 1
+  done
+  return 1
+}
+
+update_blocked_reason() {
+  # prints why a self-update can't happen, or nothing at all if it can
+  local self="$1"
+  [ "$NO_UPDATE" = "1" ]                  && { printf 'disabled by CAROUSEL_NO_UPDATE\n'; return; }
+  [ -n "${CAROUSEL_UPDATED:-}" ]          && { printf 'already updated in this run\n'; return; }
+  command -v curl >/dev/null 2>&1         || { printf 'curl not found\n'; return; }
+  [ -f "$self" ]                          || { printf "can't locate the carousel script\n"; return; }
+  [ -L "$self" ]                          && { printf 'installed as a symlink — update whatever it points at\n'; return; }
+  [ -w "$self" ]                          || { printf '%s is not writable\n' "$self"; return; }
+  [ -w "$(dirname "$self")" ]             || { printf '%s is not writable\n' "$(dirname "$self")"; return; }
+  if (cd "$(dirname "$self")" 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1); then
+    printf 'running from a git checkout — use git pull instead\n'; return
+  fi
+  return 0
+}
+
+remote_version() {
+  local v
+  v=$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1)
+  [ -n "$v" ] || return 1
+  printf '%s\n' "$v"
+}
+
+fetch_update() {
+  # downloads the latest script next to $1 and echoes the temp path, or nothing.
+  # The temp file is a sibling so the later mv stays on one filesystem and is
+  # therefore atomic: the running shell keeps reading the old inode either way.
+  local self="$1" tmp
+  tmp=$(mktemp "$self.XXXXXX" 2>/dev/null) || return 1
+  if ! curl -fsSL --max-time "${CAROUSEL_UPDATE_TIMEOUT:-2}" "$UPDATE_URL" -o "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; return 1
+  fi
+  # Refuse anything that isn't a syntactically valid carousel: a captive-portal
+  # login page or a truncated download must never land on the user's PATH.
+  case "$(head -n 1 "$tmp")" in
+    '#!'*bash*) ;;
+    *) rm -f "$tmp"; return 1 ;;
+  esac
+  if ! remote_version "$tmp" >/dev/null || ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; return 1
+  fi
+  printf '%s\n' "$tmp"
+}
+
+install_update() {
+  local tmp="$1" self="$2"
+  chmod 755 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$self" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+stamp_update_check() {
+  mkdir -p "$CAROUSEL_HOME" 2>/dev/null || return 0
+  date +%s > "$UPDATE_STAMP" 2>/dev/null || true
+}
+
+update_check_due() {
+  case "$UPDATE_INTERVAL" in
+    ''|*[!0-9]*) return 1 ;;   # unparseable interval: don't check at all
+    0)           return 1 ;;
+  esac
+  [ -f "$UPDATE_STAMP" ] || return 0
+  local last now
+  last=$(tr -cd '0-9' < "$UPDATE_STAMP" 2>/dev/null)
+  [ -n "$last" ] || return 0
+  now=$(date +%s)
+  [ $((now - last)) -ge "$UPDATE_INTERVAL" ]
+}
+
+maybe_self_update() {
+  # Called only on the run/go paths, and only with a terminal attached, so that
+  # `carousel -p ...` in a script or in CI never pays for it.
+  [ -t 2 ] || return 0
+  update_check_due || return 0
+  local self; self=$(self_path)
+  [ -n "$(update_blocked_reason "$self")" ] && return 0
+
+  stamp_update_check
+  local tmp; tmp=$(fetch_update "$self") || return 0
+  [ -n "$tmp" ] || return 0
+
+  local new old; new=$(remote_version "$tmp"); old="$VERSION"
+  if ! version_gt "$new" "$old"; then rm -f "$tmp"; return 0; fi
+  install_update "$tmp" "$self" || return 0
+
+  printf '%s✓%s carousel updated %s → %s\n' "$C_G" "$C_0" "$old" "$new" >&2
+  CAROUSEL_UPDATED=1 exec "$self" "$@"
+}
+
+cmd_update() {
+  local self; self=$(self_path)
+  local reason; reason=$(update_blocked_reason "$self")
+  [ -n "$reason" ] && die "can't self-update: $reason"
+
+  printf 'checking %s\n' "$UPDATE_URL"
+  stamp_update_check
+  local tmp CAROUSEL_UPDATE_TIMEOUT=10
+  tmp=$(fetch_update "$self")
+  [ -n "$tmp" ] || die "could not fetch a usable script from $UPDATE_URL"
+
+  local new; new=$(remote_version "$tmp")
+  if ! version_gt "$new" "$VERSION"; then
+    rm -f "$tmp"
+    printf '%s✓%s already up to date (%s)\n' "$C_G" "$C_0" "$VERSION"
+    return 0
+  fi
+  install_update "$tmp" "$self" || die "could not write $self"
+  printf '%s✓%s carousel updated %s → %s\n' "$C_G" "$C_0" "$VERSION" "$new"
+}
+
 # --- subcommands -------------------------------------------------------------
 cmd_add() {
   local name="${1:-}"
   [ -n "$name" ] || die "usage: carousel add <name>"
   [ "$name" = "default" ] && die "'default' is reserved for your existing ~/.claude"
-  case "$name" in .*|*/*) die "profile name can't start with '.' or contain '/'";; esac
+  case "$name" in
+    .*|*/*) die "profile name can't start with '.' or contain '/'" ;;
+    -*)     die "profile name can't start with '-' (those are forwarded to claude)" ;;
+  esac
   is_reserved "$name" && die "'$name' is a reserved command name, pick another"
 
   local dir="$PROFILE_ROOT/$name"
@@ -214,8 +363,17 @@ has_permission_flag() {
 }
 
 cmd_run() {
-  local name="${1:-}"
-  if [ -z "$name" ]; then name=$(get_default); else shift; fi
+  # A first argument that looks like a flag is always meant for Claude Code,
+  # with no exceptions: "carousel --resume" runs the default profile and
+  # forwards --resume, and "carousel --help" reaches claude's help. carousel's
+  # own commands are plain words ("carousel help", "carousel version"), so the
+  # two sets can never collide. "--" is accepted as the usual explicit form.
+  local name
+  case "${1:-}" in
+    --)    shift; name=$(get_default) ;;
+    ""|-*) name=$(get_default) ;;
+    *)     name="$1"; shift ;;
+  esac
   profile_exists "$name" || die "profile '$name' does not exist. See: carousel ls"
   sync_profile "$name"
 
@@ -582,6 +740,9 @@ cmd_doctor() {
   esac
   printf 'carousel home : %s\n' "$CAROUSEL_HOME"
   printf 'bypass mode   : %s (--dangerously-skip-permissions; set CAROUSEL_BYPASS=0 to turn off)\n' "$([ "$BYPASS" = "1" ] && echo on || echo off)"
+  local self blocked; self=$(self_path); blocked=$(update_blocked_reason "$self")
+  printf 'script path   : %s\n' "$self"
+  printf 'auto-update   : %s\n' "${blocked:-on (checks every ${UPDATE_INTERVAL}s; set CAROUSEL_NO_UPDATE=1 to turn off)}"
 }
 
 usage_row() {
@@ -604,6 +765,7 @@ usage() {
   usage_row "$me login <name>"    "$w" "log in to a profile (first-time setup)"
   usage_row "$me <name> [args...]" "$w" "run Claude Code as that profile"
   usage_row "$me"                 "$w" "run the default profile"
+  usage_row "$me [claude args...]" "$w" "ditto — every -flag goes to claude"
   usage_row "$me use <name>"      "$w" "set the default profile"
   usage_row "$me whoami"          "$w" "show which profile the current shell is in"
   usage_row "$me order [names...]" "$w" "view/set the rotation order for \"go\""
@@ -613,7 +775,9 @@ usage() {
   usage_row "$me rm <name>"       "$w" "remove a profile"
   usage_row "$me alias [name]"    "$w" "register/change a short shell alias (--remove to undo)"
   usage_row "$me star"            "$w" "star the repo, if you find this useful"
+  usage_row "$me update"          "$w" "update carousel now (it also self-updates daily)"
   usage_row "$me doctor"          "$w" "environment / troubleshooting info"
+  usage_row "$me help"            "$w" "this help"
   usage_row "$me version"         "$w" "print the version"
 
 
@@ -623,13 +787,28 @@ usage() {
 
   cat <<EOF
 
+Every carousel command above is a plain word, so anything starting with "-" is
+forwarded to Claude Code untouched — "$me --resume", "$me --help", "$me -p ...".
+carousel's own help and version are "$me help" and "$me version".
+
 Your existing Claude Code login is always available as the "default" profile —
 nothing to migrate, no re-login needed for the account you already use.
 
 Bypass mode (--dangerously-skip-permissions) is ON by default. Turn it off with:
   export CAROUSEL_BYPASS=0
+
+carousel checks for a new version once a day when it launches Claude Code, and
+updates itself in place. Turn that off with:
+  export CAROUSEL_NO_UPDATE=1
 EOF
 }
+
+# Only the paths that actually launch Claude Code pay for an update check —
+# and only once a day. Everything else dispatches straight through.
+case "${1:-}" in
+  ls|list|add|login|use|switch|whoami|who|sync|rm|remove|order|doctor|alias|star|update|version|help) ;;
+  *) maybe_self_update "$@" ;;
+esac
 
 case "${1:-}" in
   ls|list)      shift; cmd_ls "$@" ;;
@@ -642,9 +821,10 @@ case "${1:-}" in
   order)        shift; cmd_order "$@" ;;
   go)           shift; cmd_go "$@" ;;
   doctor)       shift; cmd_doctor "$@" ;;
-  version|-v|--version) printf 'claude-carousel %s\n' "$VERSION" ;;
+  version)      printf 'claude-carousel %s\n' "$VERSION" ;;
   alias)        shift; cmd_alias "$@" ;;
+  update)       shift; cmd_update "$@" ;;
   star)         shift; cmd_star "$@" ;;
-  help|-h|--help) usage ;;
+  help)         usage ;;
   *)            cmd_run "$@" ;;
 esac

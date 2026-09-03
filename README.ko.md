@@ -95,6 +95,7 @@ cc go                  # 실행하다 한도에 걸리면 다음 계정으로 �
 | `cc login <이름>` | 해당 프로필로 Claude Code 로그인 절차 실행 |
 | `cc <이름> [인자…]` | 그 프로필로 Claude Code 실행 (추가 인자는 그대로 전달) |
 | `cc` | 기본 프로필로 실행 |
+| `cc [claude 인자…]` | 기본 프로필로 실행 — `-`로 시작하는 인자는 전부 `claude`로 |
 | `cc use <이름>` | 기본 프로필 지정 |
 | `cc whoami` | 현재 셸이 어느 프로필인지 확인 |
 | `cc order [이름…]` | 로테이션 순서 조회/설정 |
@@ -103,6 +104,9 @@ cc go                  # 실행하다 한도에 걸리면 다음 계정으로 �
 | `cc rm <이름>` | 프로필 삭제 (심볼릭 링크만 해제, 원본은 그대로) |
 | `cc alias [이름]` | 짧은 셸 alias 등록/변경 (`--remove`로 해제) |
 | `cc doctor` | 환경 및 문제 해결 정보 |
+| `cc update` | 지금 carousel 업데이트 (하루 한 번 자동으로도 갱신) |
+| `cc help` | carousel 도움말 (`cc --help`는 Claude Code 쪽) |
+| `cc version` | carousel 버전 (`cc --version`은 Claude Code 쪽) |
 
 ## 짧은 alias
 
@@ -188,6 +192,46 @@ export CAROUSEL_BYPASS=0
 
 직접 `--permission-mode …`나 skip 플래그를 넘기면 이 설정보다 항상 우선합니다.
 
+## Claude Code에 인자 전달하기
+
+carousel이 모르는 인자는 전부 `claude`로 그대로 넘어갑니다. 쓰던 플래그가 그대로 동작합니다.
+
+```bash
+cc --resume                 # 기본 프로필로 claude --resume
+cc -p "이 저장소 요약해줘"    # claude -p "…"
+cc work --model opus        # "work" 프로필로
+cc go --resume              # rate-limit 로테이션과 함께
+```
+
+예외는 없습니다. **`-`로 시작하면 전부 Claude Code의 것입니다.** carousel 명령은 모두
+띄어쓰기로 구분되는 맨단어라서 둘이 겹칠 일이 없습니다.
+
+```bash
+cc --help        # claude 도움말
+cc help          # carousel 도움말
+cc --version     # claude 버전
+cc version       # carousel 버전
+```
+
+## 최신 버전 유지
+
+carousel은 파일 하나라, 업데이트도 그 파일을 다시 받아오는 것이 전부입니다. carousel을
+통해 Claude Code를 실행하면 하루에 최대 한 번 GitHub에서 새 버전을 확인하고, 원자적으로
+자기 자신을 교체한 뒤 입력한 명령을 그대로 다시 실행합니다. 이때만 한 줄이 출력됩니다.
+
+```console
+$ cc
+✓ carousel updated 0.2.0 → 0.3.0
+```
+
+내려받은 내용이 문법적으로 유효한 carousel 스크립트가 아니면 교체하지 않습니다. 터미널이
+없을 때(CI, 스크립트 안의 `cc -p …`), carousel이 심볼릭 링크일 때, git 클론에서 실행할 때는
+확인 자체를 건너뜁니다. `cc update`는 지금 바로 확인하고, `cc doctor`는 현재 상태를 보여줍니다.
+
+```bash
+export CAROUSEL_NO_UPDATE=1   # 확인하지 않음
+```
+
 ## 설정
 
 | 환경변수 | 기본값 | 용도 |
@@ -195,6 +239,8 @@ export CAROUSEL_BYPASS=0
 | `CAROUSEL_BYPASS` | `1` | `0`이면 Claude Code의 기본 권한 프롬프트를 유지 |
 | `CAROUSEL_HOME` | `~/.claude-carousel` | 프로필과 설정이 저장되는 위치 |
 | `CAROUSEL_CLAUDE_BIN` | `claude` | `claude` 바이너리 경로 |
+| `CAROUSEL_NO_UPDATE` | `0` | `1`이면 하루 한 번의 자동 업데이트 확인을 끔 |
+| `CAROUSEL_UPDATE_INTERVAL` | `86400` | 업데이트 확인 간격(초) |
 
 ## 라이선스
 

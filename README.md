@@ -95,6 +95,7 @@ credential slot, so the sessions don't fight over a token.
 | `cc login <name>` | Open Claude Code's login flow for a profile |
 | `cc <name> [args…]` | Run Claude Code as that profile (extra args pass through) |
 | `cc` | Run the default profile |
+| `cc [claude args…]` | Run the default profile — every `-`flag goes to `claude` |
 | `cc use <name>` | Set the default profile |
 | `cc whoami` | Which profile is the current shell in? |
 | `cc order [names…]` | View or set the rotation order |
@@ -103,6 +104,9 @@ credential slot, so the sessions don't fight over a token.
 | `cc rm <name>` | Delete a profile (symlinks unlinked; originals untouched) |
 | `cc alias [name]` | Register or change a short shell alias (`--remove` to undo) |
 | `cc doctor` | Environment and troubleshooting info |
+| `cc update` | Update carousel now (it also self-updates once a day) |
+| `cc help` | carousel's own help (`cc --help` is Claude Code's) |
+| `cc version` | carousel's own version (`cc --version` is Claude Code's) |
 
 ## A shorter alias
 
@@ -193,6 +197,48 @@ export CAROUSEL_BYPASS=0
 
 Passing `--permission-mode …` or the skip flag yourself always wins over this setting.
 
+## Passing arguments to Claude Code
+
+Anything carousel doesn't recognise goes straight to `claude`, so the flags you already
+use keep working:
+
+```bash
+cc --resume                 # claude --resume, as the default profile
+cc -p "summarise this repo" # claude -p "…"
+cc work --model opus        # …as the "work" profile
+cc go --resume              # …with rate-limit rotation
+```
+
+There are no exceptions: **anything starting with `-` belongs to Claude Code.** Every
+carousel command is a plain word instead, so the two sets can never collide.
+
+```bash
+cc --help        # claude's help
+cc help          # carousel's help
+cc --version     # claude's version
+cc version       # carousel's version
+```
+
+## Staying up to date
+
+carousel is one file, so updating is just fetching it again. When you launch Claude Code
+through it, carousel checks GitHub for a newer version at most once a day, replaces itself
+atomically, and re-runs your command — you'll see a single line when it happens:
+
+```console
+$ cc
+✓ carousel updated 0.2.0 → 0.3.0
+```
+
+The download is rejected unless it's a real, syntactically valid carousel script, and the
+check is skipped entirely when there's no terminal (CI, `cc -p …` in a script), when
+carousel is a symlink, or when it's running from a git clone. `cc update` forces a check
+now; `cc doctor` shows the current state.
+
+```bash
+export CAROUSEL_NO_UPDATE=1   # never check
+```
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -200,6 +246,8 @@ Passing `--permission-mode …` or the skip flag yourself always wins over this 
 | `CAROUSEL_BYPASS` | `1` | `0` keeps Claude Code's normal permission prompts |
 | `CAROUSEL_HOME` | `~/.claude-carousel` | Where profiles and settings live |
 | `CAROUSEL_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
+| `CAROUSEL_NO_UPDATE` | `0` | `1` turns off the daily self-update check |
+| `CAROUSEL_UPDATE_INTERVAL` | `86400` | Seconds between update checks |
 
 ## License
 

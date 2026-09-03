@@ -97,6 +97,7 @@ cc go                  # 上限に達したら次のアカウントへ自動で�
 | `cc login <名前>` | そのプロファイルで Claude Code のログイン手順を実行 |
 | `cc <名前> [引数…]` | そのプロファイルで Claude Code を起動（追加引数はそのまま渡す） |
 | `cc` | デフォルトのプロファイルで起動 |
+| `cc [claude の引数…]` | デフォルトのプロファイルで起動 — `-` で始まる引数はすべて `claude` へ |
 | `cc use <名前>` | デフォルトのプロファイルを設定 |
 | `cc whoami` | いまのシェルがどのプロファイルかを表示 |
 | `cc order [名前…]` | ローテーション順の確認・設定 |
@@ -105,6 +106,9 @@ cc go                  # 上限に達したら次のアカウントへ自動で�
 | `cc rm <名前>` | プロファイルを削除（シンボリックリンクのみ解除、元は無傷） |
 | `cc alias [名前]` | 短いシェル alias を登録・変更（`--remove` で解除） |
 | `cc doctor` | 環境とトラブルシューティング情報 |
+| `cc update` | いま carousel を更新（1 日 1 回、自動でも更新されます） |
+| `cc help` | carousel のヘルプ（`cc --help` は Claude Code のもの） |
+| `cc version` | carousel のバージョン（`cc --version` は Claude Code のもの） |
 
 ## 短い alias
 
@@ -190,6 +194,49 @@ export CAROUSEL_BYPASS=0
 
 自分で `--permission-mode …` や skip フラグを渡した場合は、この設定より常に優先されます。
 
+## Claude Code への引数の渡し方
+
+carousel が知らない引数はそのまま `claude` に渡されるので、いつも使っているフラグが
+そのまま動きます。
+
+```bash
+cc --resume                 # デフォルトのプロファイルで claude --resume
+cc -p "このリポジトリを要約して"  # claude -p "…"
+cc work --model opus        # "work" プロファイルで
+cc go --resume              # rate limit ローテーション付きで
+```
+
+例外はありません。**`-` で始まるものはすべて Claude Code のものです。** carousel の
+コマンドはどれも空白区切りの素の単語なので、両者がぶつかることはありません。
+
+```bash
+cc --help        # claude のヘルプ
+cc help          # carousel のヘルプ
+cc --version     # claude のバージョン
+cc version       # carousel のバージョン
+```
+
+## 最新の状態を保つ
+
+carousel はファイル 1 つなので、更新はそれをもう一度取得するだけです。carousel 経由で
+Claude Code を起動すると、1 日に最大 1 回だけ GitHub の新しいバージョンを確認し、自分自身を
+アトミックに置き換えたうえで、入力したコマンドをそのまま実行し直します。そのときだけ 1 行
+表示されます。
+
+```console
+$ cc
+✓ carousel updated 0.2.0 → 0.3.0
+```
+
+ダウンロードした中身が構文的に妥当な carousel スクリプトでなければ置き換えません。端末が
+ない場合（CI、スクリプト内の `cc -p …`）、carousel がシンボリックリンクの場合、git クローンから
+実行している場合は、確認自体を行いません。`cc update` はいますぐ確認し、`cc doctor` は現在の
+状態を表示します。
+
+```bash
+export CAROUSEL_NO_UPDATE=1   # 確認しない
+```
+
 ## 設定
 
 | 環境変数 | デフォルト | 用途 |
@@ -197,6 +244,8 @@ export CAROUSEL_BYPASS=0
 | `CAROUSEL_BYPASS` | `1` | `0` で Claude Code の通常の権限プロンプトを維持 |
 | `CAROUSEL_HOME` | `~/.claude-carousel` | プロファイルと設定の保存場所 |
 | `CAROUSEL_CLAUDE_BIN` | `claude` | `claude` バイナリのパス |
+| `CAROUSEL_NO_UPDATE` | `0` | `1` で 1 日 1 回の自動更新チェックを無効化 |
+| `CAROUSEL_UPDATE_INTERVAL` | `86400` | 更新チェックの間隔（秒） |
 
 ## ライセンス
 
