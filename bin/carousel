@@ -17,7 +17,7 @@
 
 set -u
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 DEFAULT_DIR="$HOME/.claude"
 CAROUSEL_HOME="${CAROUSEL_HOME:-$HOME/.claude-carousel}"
@@ -153,15 +153,64 @@ print(a.get("emailAddress") or "(not logged in)")
 }
 
 # --- shared-asset sync ------------------------------------------------------
+# Everything under ~/.claude that isn't account state is shared across profiles
+# by symlink, so an edit made from any profile is the edit every profile sees.
+#
+# Files get the same treatment as directories on purpose. Claude Code rewrites
+# settings.json whenever you touch /plugin, /config or an MCP server, so the
+# copy this used to make was only ever authoritative until the next launch — at
+# which point the shared copy quietly reverted whatever you had just changed,
+# and a plugin you removed came back.
 SHARED_DIRS="plugins skills projects"
-SHARED_FILES="settings.json settings.local.json mcp.json CLAUDE.md"
+SHARED_FILES="settings.json mcp.json CLAUDE.md"
+
+# Deliberately not shared. settings.local.json is Claude Code's per-install
+# override of settings.json, which makes it the one place a profile can differ —
+# a different model, say — without forking the whole shared configuration. A new
+# profile starts from a copy of the master's and owns it from then on.
+LOCAL_FILES="settings.local.json"
+
+BACKUP_ROOT="$CAROUSEL_HOME/backups"
+
+backup_shared_file() {
+  local name="$1" item="$2" src="$3"
+  [ -f "$src" ] || return 0
+  local dir="$BACKUP_ROOT/$name"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  cp -p "$src" "$dir/$item.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+}
+
+# A profile holding a real file where a symlink belongs means one of two things:
+# it predates this version of carousel, or a writer saved the file by renaming a
+# temp file into place, which replaces the link instead of following it. The
+# second case carries edits the shared copy has never seen, so decide by mtime
+# rather than throwing the file away.
+reclaim_shared_file() {
+  local name="$1" item="$2" target="$3" master="$4"
+
+  cmp -s "$target" "$master" 2>/dev/null && return 0
+
+  # Only a strictly newer master wins. Ties go to the profile on purpose: mtime
+  # here is second-resolution, so two edits in the same second are
+  # indistinguishable, and the profile differing at all is evidence something
+  # wrote to it. Losing that edit is the bug this whole function exists to fix,
+  # and the master is backed up before it is replaced either way.
+  if [ -f "$master" ] && [ "$master" -nt "$target" ]; then
+    backup_shared_file "$name" "$item" "$target"
+    return 0
+  fi
+
+  backup_shared_file "$name" "$item" "$master"
+  cp -p "$target" "$master"
+  warn "$name/$item was newer than the shared copy — promoted it to $DEFAULT_DIR/$item"
+}
 
 sync_profile() {
   local name="$1" dir; dir=$(profile_dir "$name")
   [ "$name" = "default" ] && return 0
   [ -d "$dir" ] || die "profile '$name' does not exist. Run: carousel add $name"
 
-  local item target
+  local item target master
   for item in $SHARED_DIRS; do
     [ -e "$DEFAULT_DIR/$item" ] || continue
     target="$dir/$item"
@@ -176,11 +225,39 @@ sync_profile() {
   done
 
   for item in $SHARED_FILES; do
-    [ -f "$DEFAULT_DIR/$item" ] || continue
     target="$dir/$item"
-    if [ ! -f "$target" ] || ! cmp -s "$DEFAULT_DIR/$item" "$target"; then
-      cp -p "$DEFAULT_DIR/$item" "$target"
+    master="$DEFAULT_DIR/$item"
+    if [ -L "$target" ]; then
+      [ "$(readlink "$target")" = "$master" ] && continue
+      rm -f "$target"
+    elif [ -f "$target" ]; then
+      reclaim_shared_file "$name" "$item" "$target" "$master"
+      rm -f "$target"
     fi
+    # Nothing to point at yet. Leave it absent rather than dangling, so the
+    # first profile that creates the file gets it promoted on the next sync.
+    [ -f "$master" ] || continue
+    ln -sfn "$master" "$target"
+  done
+
+  # An older carousel shared these, so unpick any link it left behind and give
+  # the profile back a file of its own to diverge in.
+  for item in $LOCAL_FILES; do
+    target="$dir/$item"
+    [ -L "$target" ] || continue
+    master=$(readlink "$target")
+    rm -f "$target"
+    [ -f "$master" ] && cp -p "$master" "$target"
+  done
+}
+
+seed_local_files() {
+  local name="$1" dir; dir=$(profile_dir "$name")
+  local item
+  for item in $LOCAL_FILES; do
+    [ -f "$DEFAULT_DIR/$item" ] || continue
+    [ -e "$dir/$item" ] && continue
+    cp -p "$DEFAULT_DIR/$item" "$dir/$item"
   done
 }
 
@@ -334,6 +411,7 @@ cmd_add() {
 
   mkdir -p "$dir"
   sync_profile "$name"
+  seed_local_files "$name"
   printf '%s✓%s profile %s%s%s created: %s\n' "$C_G" "$C_0" "$C_B" "$name" "$C_0" "$dir"
   printf '\nNext: %scarousel login %s%s\n' "$C_B" "$name" "$C_0"
 }
@@ -449,12 +527,12 @@ cmd_rm() {
   local dir="$PROFILE_ROOT/$name"
   [ -d "$dir" ] || die "profile '$name' does not exist"
   printf 'Removing: %s\n' "$dir"
-  printf '%s(only the symlinks are unlinked — your real plugins/projects are untouched)%s\n' "$C_D" "$C_0"
+  printf '%s(only the symlinks are unlinked — your real plugins, projects and settings are untouched)%s\n' "$C_D" "$C_0"
   printf 'Proceed? [y/N] '
   read -r ans
   case "$ans" in y|Y|yes|YES) ;; *) printf 'cancelled\n'; return;; esac
   local item
-  for item in $SHARED_DIRS; do [ -L "$dir/$item" ] && rm -f "$dir/$item"; done
+  for item in $SHARED_DIRS $SHARED_FILES; do [ -L "$dir/$item" ] && rm -f "$dir/$item"; done
   rm -rf "$dir"
   printf '%s✓%s removed\n' "$C_G" "$C_0"
 }
@@ -739,6 +817,8 @@ cmd_doctor() {
     *)      printf 'credentials   : a local file under each profile'\''s CLAUDE_CONFIG_DIR (handled automatically by Claude Code itself)\n' ;;
   esac
   printf 'carousel home : %s\n' "$CAROUSEL_HOME"
+  printf 'shared assets : symlinked to %s (%s %s)\n' "$DEFAULT_DIR" "$SHARED_DIRS" "$SHARED_FILES"
+  printf 'per-profile   : %s\n' "$LOCAL_FILES"
   printf 'bypass mode   : %s (--dangerously-skip-permissions; set CAROUSEL_BYPASS=0 to turn off)\n' "$([ "$BYPASS" = "1" ] && echo on || echo off)"
   local self blocked; self=$(self_path); blocked=$(update_blocked_reason "$self")
   printf 'script path   : %s\n' "$self"
@@ -771,7 +851,7 @@ usage() {
   usage_row "$me order [names...]" "$w" "view/set the rotation order for \"go\""
   usage_row "$me go [args...]"     "$w" "run, auto-rotating to the next profile if"
   usage_row ""                    "$w" "the current one looks rate-limited"
-  usage_row "$me sync [name]"     "$w" "re-sync shared plugins/settings from ~/.claude"
+  usage_row "$me sync [name]"     "$w" "re-link shared plugins/settings to ~/.claude"
   usage_row "$me rm <name>"       "$w" "remove a profile"
   usage_row "$me alias [name]"    "$w" "register/change a short shell alias (--remove to undo)"
   usage_row "$me star"            "$w" "star the repo, if you find this useful"
