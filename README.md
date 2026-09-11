@@ -163,11 +163,22 @@ carousel is essentially a small amount of bookkeeping around that one environmen
         ├── plugins  -> ~/.claude/plugins    (symlink)
         ├── skills   -> ~/.claude/skills     (symlink)
         ├── projects -> ~/.claude/projects   (symlink)
-        └── settings.json              ← copied from ~/.claude on each run
+        ├── settings.json -> ~/.claude/settings.json   (symlink)
+        └── settings.local.json        ← this profile's own overrides
 ```
 
-`settings.json` is copied rather than symlinked because Claude Code rewrites it atomically,
-which replaces a symlink with a regular file.
+`settings.json` used to be copied rather than symlinked, because Claude Code can rewrite it
+atomically and a rename replaces a symlink with a regular file. Copying traded that away for a
+worse problem: it only ever flowed one way, so a plugin you disabled or an MCP server you added
+from inside a profile was silently reverted on the next launch. Since 0.3.0 it is symlinked like
+everything else, and `sync` repairs the link when a rename does break it — promoting the profile's
+version to `~/.claude` first, so the edit survives. Anything replaced is backed up under
+`~/.claude-carousel/backups/<profile>/`.
+
+`settings.local.json` is the exception. Claude Code treats it as a local override of
+`settings.json`, so each profile keeps a real file of its own. That makes it the place to put
+anything one profile should keep to itself — a different `model`, say — without forking the
+shared configuration.
 
 ## Rate-limit rotation, honestly
 
