@@ -160,11 +160,21 @@ carousel은 본질적으로 그 환경변수 하나를 둘러싼 약간의 정�
         ├── plugins  -> ~/.claude/plugins    (심볼릭 링크)
         ├── skills   -> ~/.claude/skills     (심볼릭 링크)
         ├── projects -> ~/.claude/projects   (심볼릭 링크)
-        └── settings.json              ← 실행할 때마다 ~/.claude에서 복사
+        ├── settings.json -> ~/.claude/settings.json   (심볼릭 링크)
+        └── settings.local.json        ← 이 프로필만의 오버라이드
 ```
 
-`settings.json`은 심볼릭 링크가 아니라 복사입니다. Claude Code가 이 파일을 atomic write로
-다시 쓰는데, 그러면 심볼릭 링크가 일반 파일로 대체되기 때문입니다.
+예전에는 `settings.json`을 심볼릭 링크가 아니라 복사로 다뤘습니다. Claude Code가 이 파일을
+atomic write로 다시 쓸 수 있고, rename은 심볼릭 링크를 일반 파일로 대체하기 때문입니다.
+하지만 복사는 더 나쁜 문제를 낳았습니다. 복사가 한 방향으로만 흘러서, 프로필 안에서 끈
+플러그인이나 추가한 MCP 서버가 다음 실행 때 조용히 되돌아갔습니다. 0.3.0부터는 나머지와
+똑같이 심볼릭 링크로 두고, rename으로 링크가 실제로 끊기면 `sync`가 복구합니다. 이때 프로필
+쪽 내용을 먼저 `~/.claude`로 승격하므로 변경분이 살아남습니다. 교체되는 파일은
+`~/.claude-carousel/backups/<프로필>/`에 백업됩니다.
+
+`settings.local.json`만 예외입니다. Claude Code가 이 파일을 `settings.json`의 로컬
+오버라이드로 취급하므로, 프로필마다 실제 파일로 남겨둡니다. 특정 프로필만 다르게 가져가고
+싶은 설정은 — 예를 들어 다른 `model` — 공유 설정을 포크하지 않고 여기에 넣으면 됩니다.
 
 ## rate-limit 로테이션, 솔직하게
 

@@ -162,11 +162,23 @@ carousel は本質的に、その環境変数 1 つを取り巻く少しの管�
         ├── plugins  -> ~/.claude/plugins    (シンボリックリンク)
         ├── skills   -> ~/.claude/skills     (シンボリックリンク)
         ├── projects -> ~/.claude/projects   (シンボリックリンク)
-        └── settings.json              ← 起動ごとに ~/.claude からコピー
+        ├── settings.json -> ~/.claude/settings.json   (シンボリックリンク)
+        └── settings.local.json        ← このプロファイル専用の上書き設定
 ```
 
-`settings.json` はシンボリックリンクではなくコピーです。Claude Code がこのファイルを atomic
-write で書き直すため、シンボリックリンクが通常ファイルに置き換わってしまうからです。
+`settings.json` は以前、シンボリックリンクではなくコピーでした。Claude Code がこのファイルを
+atomic write で書き直すことがあり、rename がシンボリックリンクを通常ファイルに置き換えて
+しまうからです。しかしコピーはより厄介な問題を招きました。コピーが一方向にしか流れないため、
+プロファイル内で無効にしたプラグインや追加した MCP サーバーが、次回起動時に黙って元へ戻って
+いたのです。0.3.0 からは他と同じくシンボリックリンクにし、rename でリンクが実際に切れた場合は
+`sync` が修復します。その際プロファイル側の内容を先に `~/.claude` へ昇格させるので、編集は
+失われません。置き換えられるファイルは `~/.claude-carousel/backups/<プロファイル>/` に
+バックアップされます。
+
+`settings.local.json` だけは例外です。Claude Code がこのファイルを `settings.json` の
+ローカル上書きとして扱うため、プロファイルごとに実体ファイルのまま残します。特定の
+プロファイルだけ変えたい設定は — 例えば別の `model` — 共有設定をフォークせずにここへ
+書けます。
 
 ## rate limit ローテーションについて、正直に
 

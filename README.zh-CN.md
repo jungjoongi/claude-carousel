@@ -157,11 +157,19 @@ carousel 本质上就是围绕这一个环境变量做的少量管理工作：
         ├── plugins  -> ~/.claude/plugins    (软链接)
         ├── skills   -> ~/.claude/skills     (软链接)
         ├── projects -> ~/.claude/projects   (软链接)
-        └── settings.json              ← 每次运行时从 ~/.claude 复制
+        ├── settings.json -> ~/.claude/settings.json   (软链接)
+        └── settings.local.json        ← 该配置目录专属的覆盖设置
 ```
 
-`settings.json` 采用复制而非软链接，因为 Claude Code 会以 atomic write 重写该文件，那样会把软链接
-替换成普通文件。
+`settings.json` 以前采用复制而非软链接，因为 Claude Code 可能以 atomic write 重写该文件，而
+rename 会把软链接替换成普通文件。但复制带来了更糟的问题：它只能单向流动，于是你在某个配置内
+停用的插件、添加的 MCP 服务器，会在下次启动时被悄悄还原。从 0.3.0 起，它和其他资源一样使用
+软链接；当 rename 确实弄断链接时，`sync` 会修复它 —— 并先把配置目录中的版本提升到
+`~/.claude`，因此改动不会丢失。被替换的文件会备份到 `~/.claude-carousel/backups/<配置名>/`。
+
+只有 `settings.local.json` 例外。Claude Code 把它当作 `settings.json` 的本地覆盖，因此每个
+配置目录都保留一份真实文件。若某个配置需要与众不同 —— 比如换一个 `model` —— 写在这里即可，
+无需分叉共享配置。
 
 ## 关于 rate limit 轮换，说实话
 
