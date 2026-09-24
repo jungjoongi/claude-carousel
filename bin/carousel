@@ -17,7 +17,7 @@
 
 set -u
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 DEFAULT_DIR="$HOME/.claude"
 CAROUSEL_HOME="${CAROUSEL_HOME:-$HOME/.claude-carousel}"
@@ -33,11 +33,11 @@ OS="$(uname -s)"
 #   export CAROUSEL_BYPASS=0
 BYPASS="${CAROUSEL_BYPASS:-1}"
 
-# Rate-limit detection patterns for `carousel go`. Best-effort and
-# intentionally editable: Claude Code's exact wording can change between
-# versions, so extend this (comma can't appear in the pattern itself) if
-# rotation isn't triggering when it should.
-RATE_LIMIT_PATTERN='usage limit|rate limit|rate-limited|quota exceeded|try again later|limit will reset'
+# What `carousel go` sends after switching accounts, so the turn a usage limit
+# cut off carries on by itself. Set it empty to resume the conversation and
+# wait at the prompt instead:
+#   export CAROUSEL_RESUME_PROMPT=
+RESUME_PROMPT="${CAROUSEL_RESUME_PROMPT-You were cut off by a usage limit. Continue where you left off.}"
 
 RESERVED_CMDS="ls list add login use switch whoami who sync rm remove order go doctor alias star update version help"
 
@@ -554,56 +554,69 @@ cmd_order() {
 }
 
 # --- rotation-aware run ("go") ------------------------------------------------
-pty_available() {
-  # `script` needs a real controlling terminal. Inside CI, some editor
-  # terminals, or anything that hands us a socket for stdin, it bails out with
-  # "tcgetattr/ioctl: Operation not supported on socket" — probe for that so we
-  # can degrade gracefully instead of failing the run.
-  case "$OS" in
-    Darwin) script -q /dev/null true >/dev/null 2>&1 ;;
-    *)      script -qc true /dev/null >/dev/null 2>&1 ;;
-  esac
+# Rotation hangs off Claude Code's own StopFailure hook, which fires when a turn
+# ends on an API error and names the error. It replaced grepping a pty capture
+# of the screen after claude exited, which could never work: the interactive UI
+# doesn't exit on a usage limit — it sits there offering to wait for the reset —
+# so the check only ran once you quit by hand, and by then the wording it looked
+# for ("usage limit", "limit will reset") had become "You've hit your session
+# limit" anyway.
+#
+# The hook is registered for this run only, through --settings. It saves its
+# input, which carries the session id, and stops claude. carousel then resumes
+# that same conversation on the next profile, which works because projects/ —
+# where transcripts live — is shared by every profile.
+
+go_prepare() {
+  local state="$1"
+  cat > "$state/on-limit.sh" <<'EOF'
+#!/bin/sh
+# Run by Claude Code when a turn ends on a rate limit, with the hook input on
+# stdin. Keep it for carousel, then stop the claude that ran us.
+here=$(dirname "$0")
+cat > "$here/limit.json"
+kill -TERM "$(cat "$here/pid")" 2>/dev/null
+EOF
+  cat > "$state/settings.json" <<EOF
+{"hooks":{"StopFailure":[{"matcher":"rate_limit","hooks":[{"type":"command","command":"/bin/sh '$state/on-limit.sh'"}]}]}}
+EOF
 }
 
-run_captured() {
-  # runs claude through a pty so a full-screen TUI app's output is actually
-  # capturable, echoing to the terminal and recording to $log at the same time
-  local name="$1" log="$2"; shift 2
-  local dir
-  if [ "$name" = "default" ]; then dir=""; else dir="$(profile_dir "$name")"; fi
+run_watched() {
+  # Runs claude in the foreground like cmd_run does, but through a shell that
+  # records its own pid and then execs claude in its place, so the pid on file
+  # is claude's and the hook knows what to stop.
+  local name="$1" state="$2"; shift 2
 
   local extra=""
   if [ "$BYPASS" = "1" ] && ! has_permission_flag "$@"; then
     extra="--dangerously-skip-permissions"
   fi
 
-  case "$OS" in
-    Darwin)
-      if [ -n "$dir" ]; then
-        CLAUDE_CONFIG_DIR="$dir" script -q "$log" "$CLAUDE_BIN" $extra "$@"
-      else
-        env -u CLAUDE_CONFIG_DIR script -q "$log" "$CLAUDE_BIN" $extra "$@"
-      fi
-      ;;
-    *)
-      if [ -n "$dir" ]; then
-        CLAUDE_CONFIG_DIR="$dir" script -qc "$CLAUDE_BIN $extra $*" "$log"
-      else
-        env -u CLAUDE_CONFIG_DIR script -qc "$CLAUDE_BIN $extra $*" "$log"
-      fi
-      ;;
-  esac
+  # shellcheck disable=SC2016
+  local launch='echo $$ > "$0/pid"; exec "$@"'
+  if [ "$name" = "default" ]; then
+    # shellcheck disable=SC2086
+    env -u CLAUDE_CONFIG_DIR sh -c "$launch" "$state" "$CLAUDE_BIN" $extra --settings "$state/settings.json" "$@"
+  else
+    # shellcheck disable=SC2086
+    CLAUDE_CONFIG_DIR="$(profile_dir "$name")" sh -c "$launch" "$state" "$CLAUDE_BIN" $extra --settings "$state/settings.json" "$@"
+  fi
+}
+
+json_field() {
+  # prints a top-level string field of a JSON file, or nothing
+  python3 -c '
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get(sys.argv[2])
+except Exception:
+    v = None
+print(v if isinstance(v, str) else "")
+' "$1" "$2" 2>/dev/null
 }
 
 cmd_go() {
-  command -v script >/dev/null 2>&1 || die "'carousel go' needs the 'script' utility (present by default on macOS and most Linux distros)"
-
-  if ! pty_available; then
-    warn "no usable pty here, so rate-limit detection is off — running the default profile directly"
-    cmd_run "$@"
-    return $?
-  fi
-
   local order_list; order_list=$(get_order)
   [ -n "$order_list" ] || die "no profiles to rotate through. Run: carousel add <name>"
 
@@ -619,7 +632,12 @@ EOF
     [ "${order[$i]}" = "$cur" ] && { start_idx=$i; break; }
   done
 
-  local tries=0
+  local state; state=$(mktemp -d "${TMPDIR:-/tmp}/carousel.XXXXXX") || die "could not create a temp directory"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$state'" EXIT
+  go_prepare "$state"
+
+  local tries=0 sid why
   while [ "$tries" -lt "$n" ]; do
     local idx=$(( (start_idx + tries) % n ))
     local name="${order[$idx]}"
@@ -627,25 +645,32 @@ EOF
 
     printf '%s▶ running as %s%s\n' "$C_B" "$name" "$C_0"
     sync_profile "$name"
-    local log; log=$(mktemp "${TMPDIR:-/tmp}/carousel.XXXXXX")
-    run_captured "$name" "$log" "$@"
+    rm -f "$state/limit.json" "$state/pid"
+    run_watched "$name" "$state" "$@"
     local exit_code=$?
 
-    if grep -qiE "$RATE_LIMIT_PATTERN" "$log" 2>/dev/null; then
-      rm -f "$log"
-      tries=$((tries + 1))
-      if [ "$tries" -ge "$n" ]; then
-        printf '%s✗%s every profile in rotation looks rate-limited\n' "$C_R" "$C_0" >&2
-        return 1
-      fi
-      local next="${order[$(( (start_idx + tries) % n ))]}"
-      printf '%s⚠ rate limit detected on %s — switching to %s in 2s (Ctrl-C to stop)%s\n' "$C_Y" "$name" "$next" "$C_0"
-      sleep 2
-      continue
-    fi
+    # No hook input means claude ended for any other reason, /exit included.
+    [ -s "$state/limit.json" ] || return "$exit_code"
 
-    rm -f "$log"
-    return "$exit_code"
+    sid=$(json_field "$state/limit.json" session_id)
+    case "$sid" in *[!0-9a-fA-F-]*) sid="" ;; esac
+    why=$(json_field "$state/limit.json" last_assistant_message | head -n 1)
+
+    # Whatever the first launch was given — a prompt, --resume, --model — is
+    # not repeated: the conversation is what carries over.
+    if [ -n "$sid" ]; then set -- --resume "$sid"; else set -- --continue; fi
+    [ -n "$RESUME_PROMPT" ] && set -- "$@" "$RESUME_PROMPT"
+
+    tries=$((tries + 1))
+    if [ "$tries" -ge "$n" ]; then
+      printf '%s✗%s every profile in rotation has hit a limit\n' "$C_R" "$C_0" >&2
+      [ -n "$sid" ] && printf '  pick the conversation up later with: carousel --resume %s\n' "$sid" >&2
+      return 1
+    fi
+    local next="${order[$(( (start_idx + tries) % n ))]}"
+    printf '%s⚠ %s: %s%s\n' "$C_Y" "$name" "${why:-rate limit}" "$C_0"
+    printf '%s  switching to %s and resuming the conversation in 2s (Ctrl-C to stop)%s\n' "$C_Y" "$next" "$C_0"
+    sleep 2
   done
 }
 
@@ -811,7 +836,11 @@ cmd_doctor() {
   printf 'OS            : %s\n' "$OS"
   printf 'shell         : %s\n' "${BASH_VERSION:+bash $BASH_VERSION}"
   printf 'claude binary : %s\n' "$(command -v "$CLAUDE_BIN" 2>/dev/null || echo 'NOT FOUND on PATH')"
-  printf 'script utility: %s\n' "$(command -v script 2>/dev/null || echo 'NOT FOUND (carousel go will not work)')"
+  if [ -n "$RESUME_PROMPT" ]; then
+    printf 'go resumes    : by sending "%s" (CAROUSEL_RESUME_PROMPT= to wait at the prompt)\n' "$RESUME_PROMPT"
+  else
+    printf 'go resumes    : at the prompt, sending nothing\n'
+  fi
   case "$OS" in
     Darwin) printf 'credentials   : macOS Keychain, per CLAUDE_CONFIG_DIR (handled automatically)\n' ;;
     *)      printf 'credentials   : a local file under each profile'\''s CLAUDE_CONFIG_DIR (handled automatically by Claude Code itself)\n' ;;
@@ -849,8 +878,8 @@ usage() {
   usage_row "$me use <name>"      "$w" "set the default profile"
   usage_row "$me whoami"          "$w" "show which profile the current shell is in"
   usage_row "$me order [names...]" "$w" "view/set the rotation order for \"go\""
-  usage_row "$me go [args...]"     "$w" "run, auto-rotating to the next profile if"
-  usage_row ""                    "$w" "the current one looks rate-limited"
+  usage_row "$me go [args...]"     "$w" "run, and on a usage limit resume the same"
+  usage_row ""                    "$w" "conversation on the next profile"
   usage_row "$me sync [name]"     "$w" "re-link shared plugins/settings to ~/.claude"
   usage_row "$me rm <name>"       "$w" "remove a profile"
   usage_row "$me alias [name]"    "$w" "register/change a short shell alias (--remove to undo)"
