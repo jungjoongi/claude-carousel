@@ -21,8 +21,8 @@
 **One bash script, zero dependencies.** Run several Claude Code accounts side by side —
 and keep working when one hits its usage limit.
 
-`cc go` launches Claude Code, watches for a rate-limit message, and automatically
-relaunches on your next account when it sees one. Nothing to build, no daemon, no config
+`cc go` launches Claude Code, and when a usage limit ends a turn it picks the same
+conversation up on your next account, automatically. Nothing to build, no daemon, no config
 file to hand-edit — just bash and the `claude` CLI you already have.
 
 ```console
@@ -35,7 +35,8 @@ $ cc ls
 
 $ cc go
 ▶ running as default
-⚠ rate limit detected on default — switching to work in 2s (Ctrl-C to stop)
+⚠ default: You've hit your session limit · resets 3pm
+  switching to work and resuming the conversation in 2s (Ctrl-C to stop)
 ▶ running as work
 ```
 
@@ -66,7 +67,7 @@ git clone https://github.com/jungjoongi/claude-carousel.git
 install -m 755 claude-carousel/bin/carousel ~/.local/bin/carousel   # anywhere on your PATH
 ```
 
-Requirements: bash 3.2+, `python3` (ships with macOS; used only to read the account email out of Claude Code's JSON), the `claude` CLI, and `script` (stock on macOS and virtually every Linux distro) if you want `cc go`.
+Requirements: bash 3.2+, `python3` (ships with macOS; used only to read small bits of Claude Code's JSON — the account email, and the session id `cc go` resumes), and the `claude` CLI.
 
 ## Quickstart
 
@@ -99,7 +100,7 @@ credential slot, so the sessions don't fight over a token.
 | `cc use <name>` | Set the default profile |
 | `cc whoami` | Which profile is the current shell in? |
 | `cc order [names…]` | View or set the rotation order |
-| `cc go [args…]` | Run with automatic rate-limit rotation |
+| `cc go [args…]` | Run; on a usage limit, resume the same conversation on the next profile |
 | `cc sync [name]` | Re-link shared plugins/settings from `~/.claude` |
 | `cc rm <name>` | Delete a profile (symlinks unlinked; originals untouched) |
 | `cc alias [name]` | Register or change a short shell alias (`--remove` to undo) |
@@ -182,19 +183,33 @@ shared configuration.
 
 ## Rate-limit rotation, honestly
 
-`cc go` runs Claude Code inside a pty (via `script`), mirrors the output to your
-terminal, and greps the captured transcript for phrases like `usage limit`,
-`rate limit`, and `limit will reset`. If it finds one, it moves to the next profile in
-`cc order` and relaunches.
+`cc go` doesn't read the screen. It registers a `StopFailure` hook for that run only
+(through `--settings`, so none of your settings files change). Claude Code fires that hook
+when a turn ends on an API error and says which error it was; carousel listens for
+`rate_limit`. When it fires, carousel:
 
-Two caveats worth stating plainly:
+1. stops that Claude Code,
+2. moves to the next profile in `cc order`, and
+3. relaunches it with `--resume <session-id>`, so you're back in the same conversation —
+   transcripts live in `projects/`, which every profile shares.
 
-1. **It's a heuristic.** Claude Code's exact wording can change between releases. If
-   rotation isn't firing when it should, edit `RATE_LIMIT_PATTERN` near the top of the
-   script — it's a plain `grep -E` alternation, deliberately kept in one obvious place.
-   PRs updating it are very welcome.
-2. **It needs a real terminal.** Inside CI or anything that doesn't hand the process a pty,
-   `cc go` prints a warning and runs normally without rotation rather than failing.
+It also sends one message, `You were cut off by a usage limit. Continue where you left off.`,
+so a task you left running keeps going on its own. To land at the prompt instead, or to
+word it your way:
+
+```bash
+export CAROUSEL_RESUME_PROMPT=          # resume, send nothing
+export CAROUSEL_RESUME_PROMPT="continue" # or your own wording
+```
+
+Caveats worth stating plainly:
+
+1. **Only the conversation carries over.** Arguments you gave the first launch — a prompt,
+   `--resume`, `--model` — aren't repeated after a switch.
+2. **It needs a Claude Code recent enough to have the `StopFailure` hook.** Without it, the
+   limit shows up as usual and nothing switches.
+3. **When every profile is limited, it stops** and prints the session id, so you can
+   `cc --resume <id>` once a limit resets.
 
 ## Bypass mode
 
@@ -217,7 +232,7 @@ use keep working:
 cc --resume                 # claude --resume, as the default profile
 cc -p "summarise this repo" # claude -p "…"
 cc work --model opus        # …as the "work" profile
-cc go --resume              # …with rate-limit rotation
+cc go --resume              # …switching accounts on a usage limit
 ```
 
 There are no exceptions: **anything starting with `-` belongs to Claude Code.** Every

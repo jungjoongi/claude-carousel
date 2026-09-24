@@ -20,7 +20,7 @@
 
 **一个 bash 脚本，零依赖。** 并行使用多个 Claude Code 账号——其中一个触及用量上限时，也能继续干活。
 
-`cc go` 会启动 Claude Code 并留意 rate limit 提示，一旦发现就自动换用下一个账号重新启动。
+`cc go` 会启动 Claude Code；一旦某一轮因用量上限而中断，就自动在下一个账号上接着同一个对话继续。
 没有要编译的东西，没有常驻守护进程，也没有需要手改的配置文件——只要 bash 和你已经装好的 `claude` CLI。
 
 ```console
@@ -33,7 +33,8 @@ $ cc ls
 
 $ cc go
 ▶ running as default
-⚠ rate limit detected on default — switching to work in 2s (Ctrl-C to stop)
+⚠ default: You've hit your session limit · resets 3pm
+  switching to work and resuming the conversation in 2s (Ctrl-C to stop)
 ▶ running as work
 ```
 
@@ -64,8 +65,8 @@ git clone https://github.com/jungjoongi/claude-carousel.git
 install -m 755 claude-carousel/bin/carousel ~/.local/bin/carousel   # PATH 上的任意位置
 ```
 
-依赖要求：bash 3.2 及以上、`python3`（macOS 自带，仅用于从 Claude Code 的 JSON 中读取账号邮箱）、
-`claude` CLI，以及若要使用 `cc go` 则需要 `script`（macOS 和几乎所有 Linux 发行版都自带）。
+依赖要求：bash 3.2 及以上、`python3`（macOS 自带，仅用于从 Claude Code 的 JSON 中读取账号邮箱，以及
+`cc go` 要恢复的会话 id）、`claude` CLI。
 
 ## 快速开始
 
@@ -97,7 +98,7 @@ cc go                  # 运行；触及上限就自动换下一个账号
 | `cc use <名称>` | 设置默认配置 |
 | `cc whoami` | 查看当前 shell 处于哪个配置 |
 | `cc order [名称…]` | 查看或设置轮换顺序 |
-| `cc go [参数…]` | 带 rate limit 自动轮换地运行 |
+| `cc go [参数…]` | 运行；触及用量上限时在下一个配置上接着同一个对话 |
 | `cc sync [名称]` | 重新链接来自 `~/.claude` 的共享插件与设置 |
 | `cc rm <名称>` | 删除配置（只解除软链接，原文件不动） |
 | `cc alias [名称]` | 注册或修改简短的 shell 别名（`--remove` 撤销） |
@@ -173,17 +174,29 @@ rename 会把软链接替换成普通文件。但复制带来了更糟的问题�
 
 ## 关于 rate limit 轮换，说实话
 
-`cc go` 在 pty 中（借助 `script`）运行 Claude Code，把输出照常显示在终端上，同时对捕获的
-内容 grep `usage limit`、`rate limit`、`limit will reset` 之类的字样。一旦命中，就切到
-`cc order` 中的下一个配置重新启动。
+`cc go` 不读屏幕。它只为这一次运行注册一个 `StopFailure` hook（通过 `--settings` 传入，所以
+你的设置文件一个都不会改）。当某一轮因 API 错误而结束时，Claude Code 会调用这个 hook 并告知是哪种
+错误；carousel 等的是其中的 `rate_limit`。hook 一触发，carousel 就会：
 
-有两点需要明确说明：
+1. 结束这个 Claude Code，
+2. 切到 `cc order` 中的下一个配置，
+3. 用 `--resume <session-id>` 重新启动——对话记录保存在所有配置共享的 `projects/` 里，所以会
+   直接回到同一个对话。
 
-1. **这是启发式判断。** Claude Code 的确切措辞可能随版本变化。如果该轮换时没有轮换，请修改脚本
-   顶部的 `RATE_LIMIT_PATTERN`——这是一个刻意放在显眼位置的普通 `grep -E` 模式。特别欢迎提交
-   更新它的 PR。
-2. **需要真实的终端。** 在 CI 等拿不到 pty 的环境里，它不会报错，而是给出警告并在没有轮换的情况下
-   照常运行。
+它还会发送一条消息（`You were cut off by a usage limit. Continue where you left off.`），让你
+挂着离开的任务自己接着跑。想停在提示符处、或换一种说法：
+
+```bash
+export CAROUSEL_RESUME_PROMPT=          # 只恢复，什么都不发
+export CAROUSEL_RESUME_PROMPT="continue" # 或者用你自己的措辞
+```
+
+需要明确说明的几点：
+
+1. **带过去的只有对话。** 第一次启动时给的参数（提示词、`--resume`、`--model` 等）在切换后
+   不会再传一遍。
+2. **需要有 `StopFailure` hook 的较新版 Claude Code。** 没有的话，上限提示照常出现，但不会切换。
+3. **所有配置都触及上限时会停下**并打印会话 id，等上限重置后用 `cc --resume <id>` 接着来。
 
 ## bypass 模式
 
@@ -204,7 +217,7 @@ carousel 不认识的参数会原样交给 `claude`，你惯用的那些 flag �
 cc --resume                 # 以默认配置执行 claude --resume
 cc -p "总结一下这个仓库"      # claude -p "…"
 cc work --model opus        # 以 "work" 配置
-cc go --resume              # 带 rate limit 轮换
+cc go --resume              # 触及用量上限时切换账号
 ```
 
 没有例外：**以 `-` 开头的一律属于 Claude Code。** carousel 的命令全是以空格分隔的普通词，

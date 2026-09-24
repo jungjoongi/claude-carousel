@@ -21,8 +21,8 @@
 **bash スクリプト 1 本、依存ゼロ。** 複数の Claude Code アカウントを並行して使い、ひとつが
 利用上限に達しても作業を続けられます。
 
-`cc go` は Claude Code を起動したあと rate limit のメッセージを監視し、検出したら次の
-アカウントで自動的に再起動します。ビルドするものも、常駐デーモンも、手で編集する設定ファイルも
+`cc go` は Claude Code を起動し、利用上限でターンが終わると、次のアカウントで同じ会話を
+自動的に続けます。ビルドするものも、常駐デーモンも、手で編集する設定ファイルも
 ありません — bash とすでに入っている `claude` CLI だけで動きます。
 
 ```console
@@ -35,7 +35,8 @@ $ cc ls
 
 $ cc go
 ▶ running as default
-⚠ rate limit detected on default — switching to work in 2s (Ctrl-C to stop)
+⚠ default: You've hit your session limit · resets 3pm
+  switching to work and resuming the conversation in 2s (Ctrl-C to stop)
 ▶ running as work
 ```
 
@@ -67,8 +68,7 @@ install -m 755 claude-carousel/bin/carousel ~/.local/bin/carousel   # PATH 上�
 ```
 
 必要なもの: bash 3.2 以上、`python3`（macOS に標準搭載。Claude Code の JSON からアカウントの
-メールアドレスを読むためだけに使います）、`claude` CLI、そして `cc go` を使うなら
-`script`（macOS とほぼすべての Linux ディストリビューションに標準搭載）。
+メールアドレスと、`cc go` が再開するセッション id を読むためだけに使います）、そして `claude` CLI。
 
 ## クイックスタート
 
@@ -101,7 +101,7 @@ cc go                  # 上限に達したら次のアカウントへ自動で�
 | `cc use <名前>` | デフォルトのプロファイルを設定 |
 | `cc whoami` | いまのシェルがどのプロファイルかを表示 |
 | `cc order [名前…]` | ローテーション順の確認・設定 |
-| `cc go [引数…]` | rate limit の自動ローテーション付きで起動 |
+| `cc go [引数…]` | 起動し、利用上限に達したら次のプロファイルで同じ会話を続ける |
 | `cc sync [名前]` | `~/.claude` の共有プラグイン・設定を再リンク |
 | `cc rm <名前>` | プロファイルを削除（シンボリックリンクのみ解除、元は無傷） |
 | `cc alias [名前]` | 短いシェル alias を登録・変更（`--remove` で解除） |
@@ -182,18 +182,33 @@ atomic write で書き直すことがあり、rename がシンボリックリン
 
 ## rate limit ローテーションについて、正直に
 
-`cc go` は Claude Code を pty の中で（`script` を使って）実行し、出力はそのまま
-ターミナルに流しつつ、記録した内容から `usage limit`、`rate limit`、`limit will reset` などの
-文言を grep します。見つかれば `cc order` の次のプロファイルへ移って再起動します。
+`cc go` は画面を読みません。その実行に限って `StopFailure` フックを登録します（`--settings`
+で渡すので、設定ファイルは一切変わりません）。Claude Code は API エラーでターンが終わると、
+どのエラーだったかを添えてこのフックを呼び、carousel はそのうち `rate_limit` を待ちます。
+フックが呼ばれると carousel は:
 
-はっきり書いておくべき点が 2 つあります。
+1. その Claude Code を終了し、
+2. `cc order` の次のプロファイルへ移り、
+3. `--resume <session-id>` で起動し直します。会話の記録はすべてのプロファイルが共有する
+   `projects/` にあるので、同じ会話にそのまま戻れます。
 
-1. **ヒューリスティックです。** Claude Code の正確な文言はリリースごとに変わりえます。
-   ローテーションが発動すべきなのにしない場合は、スクリプト冒頭の `RATE_LIMIT_PATTERN` を
-   編集してください — あえて目立つ 1 か所に置いた、ごく普通の `grep -E` パターンです。
-   これを更新する PR は特に歓迎します。
-2. **実際のターミナルが必要です。** CI のように pty が与えられない環境では、失敗せずに警告を
-   出し、ローテーションなしでそのまま実行します。
+さらにメッセージを 1 つ（`You were cut off by a usage limit. Continue where you left off.`）送り、
+任せて離席していた作業がそのまま続くようにします。プロンプトで止めておきたい場合や、文言を
+変えたい場合は:
+
+```bash
+export CAROUSEL_RESUME_PROMPT=          # 再開するだけで何も送らない
+export CAROUSEL_RESUME_PROMPT="continue" # または好きな文言で
+```
+
+はっきり書いておくべき点:
+
+1. **引き継がれるのは会話だけです。** 最初の起動で渡した引数（プロンプト、`--resume`、
+   `--model` など）は、切り替え後には渡し直しません。
+2. **`StopFailure` フックがある新しめの Claude Code が必要です。** ない場合、上限のメッセージが
+   いつもどおり出るだけで切り替えは起きません。
+3. **すべてのプロファイルが上限に達したら止まり**、セッション id を表示します。上限が
+   リセットされたら `cc --resume <id>` で続けられます。
 
 ## bypass モード
 
@@ -215,7 +230,7 @@ carousel が知らない引数はそのまま `claude` に渡されるので、�
 cc --resume                 # デフォルトのプロファイルで claude --resume
 cc -p "このリポジトリを要約して"  # claude -p "…"
 cc work --model opus        # "work" プロファイルで
-cc go --resume              # rate limit ローテーション付きで
+cc go --resume              # 利用上限に達したらアカウントを切り替え
 ```
 
 例外はありません。**`-` で始まるものはすべて Claude Code のものです。** carousel の
