@@ -146,6 +146,55 @@ config_json() {
   fi
 }
 
+share_trust() {
+  # Claude Code asks whether you trust a folder once per config dir, so every
+  # profile would ask again about a folder you already trusted in another one —
+  # including right after a switch or a rotation. When some profile trusts the
+  # current folder (or a folder above it, which Claude Code also honours), mark
+  # it trusted for this one too. A folder no profile trusts still gets asked.
+  local target; target=$(config_json "$(profile_dir "$1")")
+  [ -f "$target" ] || return 0
+  local p; local -a others=()
+  while IFS= read -r p; do
+    [ -n "$p" ] && [ "$p" != "$1" ] && others+=("$(config_json "$(profile_dir "$p")")")
+  done <<EOF
+$(list_profiles)
+EOF
+  python3 - "$target" "$(pwd -P)" ${others[@]+"${others[@]}"} <<'PY' 2>/dev/null || true
+import json, os, sys
+target, cwd, others = sys.argv[1], sys.argv[2], sys.argv[3:]
+
+def trusts(cfg, d):
+    projects = cfg.get("projects") or {}
+    while True:
+        if (projects.get(d) or {}).get("hasTrustDialogAccepted"):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+cfg = load(target)
+if not isinstance(cfg, dict) or trusts(cfg, cwd):
+    sys.exit(0)
+if not any(isinstance(o, dict) and trusts(o, cwd) for o in map(load, others)):
+    sys.exit(0)
+cfg.setdefault("projects", {}).setdefault(cwd, {})["hasTrustDialogAccepted"] = True
+tmp = target + ".carousel-tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+os.chmod(tmp, os.stat(target).st_mode & 0o777)
+os.replace(tmp, target)
+PY
+}
+
 profile_email() {
   local cfg; cfg=$(config_json "$1")
   [ -f "$cfg" ] || { printf '%s\n' "-"; return; }
@@ -476,6 +525,7 @@ cmd_run() {
   fi
 
   sync_profile "$name"
+  share_trust "$name"
 
   local extra=""
   if [ "$BYPASS" = "1" ] && ! has_permission_flag "$@"; then
@@ -726,6 +776,7 @@ EOF
     name="${seq[$i]}"
     printf '%s▶ running as %s%s\n' "$C_B" "$name" "$C_0"
     sync_profile "$name"
+    share_trust "$name"
     rm -f "$state/limit.json" "$state/switch.json" "$state/pid"
     printf '%s\n' "$name" > "$state/current"
     run_watched "$name" "$state" "$@"
