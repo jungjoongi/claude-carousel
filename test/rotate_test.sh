@@ -1,11 +1,11 @@
 #!/bin/bash
-# Tests for `carousel go` rotation.
+# Tests for rotating to the next profile on a usage limit.
 #
 # Runs carousel against a throwaway $HOME with a stand-in for claude that plays
 # out a usage limit the way Claude Code does: it runs the StopFailure hook it
 # was handed through --settings, and waits for that hook to stop it.
 #
-#   ./test/go_test.sh
+#   ./test/rotate_test.sh
 
 set -u
 
@@ -31,6 +31,8 @@ bad()   { printf '  \033[31mFAIL\033[0m %s (got %s, want %s)\n' "$1" "$2" "$3"; 
 check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
 has()   { printf '%s' "$1" | grep -qF -- "$2" && echo yes || echo no; }
 launch() { sed -n "${1}p" "$T/launches"; }
+profiles() { cut -d'|' -f1 "$T/launches" | tr '\n' ' '; }
+count()  { wc -l < "$T/launches" | tr -d ' '; }
 
 # Logs "<profile>|<args>" for every launch. A profile listed in $T/limited hits
 # a limit; anything else exits with $FAKE_EXIT.
@@ -64,9 +66,9 @@ reset() { : > "$T/launches"; printf '%s\n' "$@" > "$T/limited"; }
 echo "a limit resumes the same conversation on the next profile"
 "$CAROUSEL" order default a b >/dev/null
 reset default a
-out=$("$CAROUSEL" go --model opus "fix the bug" 2>&1); code=$?
+out=$("$CAROUSEL" --model opus "fix the bug" 2>&1); code=$?
 check "exits with the last profile's code"   "$code" "0"
-check "ran default, then a, then b"          "$(cut -d'|' -f1 "$T/launches" | tr '\n' ' ')" "default a b "
+check "ran default, then a, then b"          "$(profiles)" "default a b "
 check "first launch gets the original args"  "$(has "$(launch 1)" "--model opus fix the bug")" "yes"
 check "first launch registers the hook"      "$(has "$(launch 1)" "--settings")" "yes"
 check "bypass is still on by default"        "$(has "$(launch 1)" "--dangerously-skip-permissions")" "yes"
@@ -76,26 +78,59 @@ check "the one after that resumes it too"    "$(has "$(launch 3)" "--resume $SID
 check "says why it switched"                 "$(has "$out" "$LIMIT_MSG")" "yes"
 check "says where it switched to"            "$(has "$out" "switching to a")" "yes"
 
+echo "a named profile rotates from itself and wraps around"
+reset a b
+out=$("$CAROUSEL" a 2>&1); code=$?
+check "exits cleanly"           "$code" "0"
+check "ran a, then b, then default" "$(profiles)" "a b default "
+
+echo "a profile left out of the order still runs first"
+"$CAROUSEL" order default a >/dev/null
+reset b
+out=$("$CAROUSEL" b 2>&1); code=$?
+check "ran b, then the order"   "$(profiles)" "b default "
+
+echo "go still works, from the default profile"
+"$CAROUSEL" order default a b >/dev/null
+reset default
+out=$("$CAROUSEL" go 2>&1); code=$?
+check "ran default, then a"     "$(profiles)" "default a "
+
 echo "a normal exit is passed through and does not rotate"
 reset
-out=$(FAKE_EXIT=7 "$CAROUSEL" go 2>&1); code=$?
+out=$(FAKE_EXIT=7 "$CAROUSEL" 2>&1); code=$?
 check "exit code passed through" "$code" "7"
-check "launched once"            "$(wc -l < "$T/launches" | tr -d ' ')" "1"
+check "launched once"            "$(count)" "1"
 
 echo "every profile limited ends the run"
 "$CAROUSEL" order default a >/dev/null
 reset default a
-out=$("$CAROUSEL" go 2>&1); code=$?
+out=$("$CAROUSEL" 2>&1); code=$?
 check "exits non-zero"             "$code" "1"
-check "tried each profile once"    "$(wc -l < "$T/launches" | tr -d ' ')" "2"
+check "tried each profile once"    "$(count)" "2"
 check "says so"                    "$(has "$out" "every profile in rotation has hit a limit")" "yes"
 check "says how to pick it up"     "$(has "$out" "carousel --resume $SID")" "yes"
 
 echo "an empty CAROUSEL_RESUME_PROMPT resumes without sending anything"
 reset default
-out=$(CAROUSEL_RESUME_PROMPT= "$CAROUSEL" go 2>&1); code=$?
+out=$(CAROUSEL_RESUME_PROMPT= "$CAROUSEL" 2>&1); code=$?
 check "exits cleanly"           "$code" "0"
 check "resume is the last word" "$(launch 2 | sed 's/.*--resume //')" "$SID"
+
+echo "-p runs go straight to claude"
+reset
+out=$(FAKE_EXIT=3 "$CAROUSEL" a -p "summarise" 2>&1); code=$?
+check "exit code passed through" "$code" "3"
+check "no hook registered"       "$(has "$(launch 1)" "--settings")" "no"
+
+echo "CAROUSEL_ROTATE=0 pins the run, but go still rotates"
+reset
+out=$(CAROUSEL_ROTATE=0 "$CAROUSEL" a 2>&1); code=$?
+check "no hook registered"       "$(has "$(launch 1)" "--settings")" "no"
+check "ran as a"                 "$(profiles)" "a "
+reset default
+out=$(CAROUSEL_ROTATE=0 "$CAROUSEL" go 2>&1); code=$?
+check "go rotated anyway"        "$(profiles)" "default a "
 
 echo "temp state is cleaned up"
 check "nothing left in TMPDIR" "$(ls -A "$TMPDIR" | wc -l | tr -d ' ')" "0"
