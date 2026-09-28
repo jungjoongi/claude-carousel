@@ -98,6 +98,7 @@ cc order default work  # 触及上限时的轮换顺序
 | `cc whoami` | 查看当前 shell 处于哪个配置 |
 | `cc order [名称…]` | 查看或设置触及上限时的轮换顺序 |
 | `cc go [参数…]` | 与 `cc` 相同，即使 `CAROUSEL_ROTATE=0` 也会轮换 |
+| `/carousel:switch [名称]` | 在会话中：用另一个 profile 继续当前对话 |
 | `cc sync [名称]` | 重新链接来自 `~/.claude` 的共享插件与设置 |
 | `cc rm <名称>` | 删除配置（只解除软链接，原文件不动） |
 | `cc alias [名称]` | 注册或修改简短的 shell 别名（`--remove` 撤销） |
@@ -201,6 +202,31 @@ export CAROUSEL_RESUME_PROMPT="continue" # 或者用你自己的措辞
 3. **所有配置都触及上限时会停下**并打印会话 id，等上限重置后用 `cc --resume <id>` 接着来。
 4. **`-p` 运行不轮换。** 脚本期望一个进程、一个答案，所以 `cc -p …` 会直接交给 Claude Code。
 5. **想停留在你指定的配置上**，就 `export CAROUSEL_ROTATE=0`。即便如此，`cc go` 仍会轮换。
+
+## 在会话中切换账号
+
+在 carousel 启动的会话里输入：
+
+```
+/carousel:switch dev    # 用 dev 继续这段对话
+/carousel:switch        # 或用 `cc order` 中的下一个 profile
+```
+
+（输入 `/switch` 后按 Tab 即可补全。）carousel 会停止当前的 Claude Code，并用指定的
+profile 以 `--resume <session-id>` 重新启动。这与触发用量上限时的机制相同，但不会发送任何
+消息，所以会停在输入框等待。之后的轮换从切换到的 profile 继续。
+
+该命令只在这次运行中通过 `--plugin-dir` 加载，同时注册一个拦截它的 `UserPromptSubmit`
+hook，所以普通的 `claude` 会话里没有它。指定不存在的 profile 或当前正在使用的 profile 时，
+会在会话中被拒绝，不会重启任何东西。
+
+注意事项：
+
+1. **只有对话会延续。** 第一次启动时给的 `--model` 等参数不会重复。
+2. **只在会轮换的运行中可用。** `CAROUSEL_ROTATE=0` 或 `-p` 运行中没有这个命令。
+3. **文件夹信任确认只出现一次，而不是每个 profile 一次。** 在任一 profile 中信任过的文件夹
+   （或其上级文件夹），在 carousel 启动的 profile 中也会标记为已信任。
+4. **Claude Code 是被停止而不是正常退出**，所以会话结束时运行的 hook 可能无法执行完。
 
 ## bypass 模式
 
