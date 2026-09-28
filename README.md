@@ -100,6 +100,7 @@ credential slot, so the sessions don't fight over a token.
 | `cc whoami` | Which profile is the current shell in? |
 | `cc order [names…]` | View or set the order a usage limit rotates through |
 | `cc go [args…]` | Same as `cc`, and rotates even with `CAROUSEL_ROTATE=0` |
+| `/carousel:switch [name]` | Inside a session: carry on the conversation as another profile |
 | `cc sync [name]` | Re-link shared plugins/settings from `~/.claude` |
 | `cc rm <name>` | Delete a profile (symlinks unlinked; originals untouched) |
 | `cc alias [name]` | Register or change a short shell alias (`--remove` to undo) |
@@ -217,6 +218,33 @@ Caveats worth stating plainly:
    goes straight to Claude Code.
 5. **To stay on the profile you named**, `export CAROUSEL_ROTATE=0`. `cc go` still rotates
    with it set.
+
+## Switching accounts mid-session
+
+Inside a session carousel started, type:
+
+```
+/carousel:switch dev    # carry on this conversation as dev
+/carousel:switch        # or as the next profile in `cc order`
+```
+
+(`/switch` and Tab completes it.) carousel stops that Claude Code and relaunches the profile
+with `--resume <session-id>`, the same way a usage limit does, but it sends nothing, so you
+land at the prompt. Rotation then carries on from the profile you switched to.
+
+The command is loaded with `--plugin-dir` for that run only, together with a
+`UserPromptSubmit` hook that catches it, so a plain `claude` session never has it. A profile
+that doesn't exist, or the one you're already on, is refused in the session and nothing
+restarts.
+
+Caveats:
+
+1. **Only the conversation carries over.** Arguments from the first launch, such as
+   `--model`, aren't repeated.
+2. **It needs a rotating run.** With `CAROUSEL_ROTATE=0`, or under `-p`, the command isn't there.
+3. **The folder-trust question is asked once, not once per profile.** A folder you trusted in
+   any profile (or a folder above it) is marked trusted in the profile carousel launches.
+4. **Claude Code is stopped, not exited**, so hooks that run at session end may be cut short.
 
 ## Bypass mode
 
