@@ -599,8 +599,58 @@ here=$(dirname "$0")
 cat > "$here/limit.json"
 kill -TERM "$(cat "$here/pid")" 2>/dev/null
 EOF
+  cat > "$state/on-switch.sh" <<'EOF'
+#!/bin/sh
+# Run by Claude Code on every prompt. Only "/carousel:switch [profile]" is
+# ours: note where to go, then stop the claude that ran us, the same way a
+# usage limit does. Anything else goes through untouched.
+here=$(dirname "$0")
+input=$(cat)
+case "$input" in *'"prompt":"/carousel:switch'*) ;; *) exit 0 ;; esac
+python3 - "$here" "$input" <<'PY'
+import json, os, re, sys
+here, d = sys.argv[1], json.loads(sys.argv[2])
+m = re.fullmatch(r"\s*/carousel:switch(?:\s+(\S+))?\s*", d.get("prompt", ""))
+if not m:
+    sys.exit(0)
+def block(reason):
+    print(json.dumps({"decision": "block", "reason": reason}))
+target = m.group(1) or ""
+names = open(os.path.join(here, "profiles")).read().split()
+current = open(os.path.join(here, "current")).read().strip()
+if target and target not in names:
+    block("carousel: no profile named '%s'. Profiles: %s" % (target, ", ".join(names)))
+    sys.exit(0)
+if target == current:
+    block("carousel: already running as %s" % current)
+    sys.exit(0)
+with open(os.path.join(here, "switch.json"), "w") as f:
+    json.dump({"session_id": d.get("session_id", ""),
+               "transcript_path": d.get("transcript_path", ""),
+               "target": target}, f)
+block("carousel: switching to %s" % (target or "the next profile"))
+sys.exit(10)
+PY
+[ $? -eq 10 ] && kill -TERM "$(cat "$here/pid")" 2>/dev/null
+exit 0
+EOF
+  # The command has to exist for the prompt to reach the hook at all: the
+  # interactive UI answers an unknown "/switch" itself. Loading it as a plugin
+  # for this run only keeps it out of runs carousel isn't watching.
+  mkdir -p "$state/plugin/.claude-plugin" "$state/plugin/commands"
+  cat > "$state/plugin/.claude-plugin/plugin.json" <<'EOF'
+{"name":"carousel","version":"1.0.0","description":"Commands for a carousel-managed session"}
+EOF
+  cat > "$state/plugin/commands/switch.md" <<'EOF'
+---
+description: Resume this conversation as another carousel profile (next in order if none given)
+argument-hint: "[profile]"
+---
+carousel's hook should have handled this command before it reached you. Tell the user in one sentence that the profile switch did not happen, and do nothing else.
+EOF
+  list_profiles > "$state/profiles"
   cat > "$state/settings.json" <<EOF
-{"hooks":{"StopFailure":[{"matcher":"rate_limit","hooks":[{"type":"command","command":"/bin/sh '$state/on-limit.sh'"}]}]}}
+{"hooks":{"StopFailure":[{"matcher":"rate_limit","hooks":[{"type":"command","command":"/bin/sh '$state/on-limit.sh'"}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/bin/sh '$state/on-switch.sh'"}]}]}}
 EOF
 }
 
@@ -619,10 +669,10 @@ run_watched() {
   local launch='echo $$ > "$0/pid"; exec "$@"'
   if [ "$name" = "default" ]; then
     # shellcheck disable=SC2086
-    env -u CLAUDE_CONFIG_DIR sh -c "$launch" "$state" "$CLAUDE_BIN" $extra --settings "$state/settings.json" "$@"
+    env -u CLAUDE_CONFIG_DIR sh -c "$launch" "$state" "$CLAUDE_BIN" $extra --settings "$state/settings.json" --plugin-dir "$state/plugin" "$@"
   else
     # shellcheck disable=SC2086
-    CLAUDE_CONFIG_DIR="$(profile_dir "$name")" sh -c "$launch" "$state" "$CLAUDE_BIN" $extra --settings "$state/settings.json" "$@"
+    CLAUDE_CONFIG_DIR="$(profile_dir "$name")" sh -c "$launch" "$state" "$CLAUDE_BIN" $extra --settings "$state/settings.json" --plugin-dir "$state/plugin" "$@"
   fi
 }
 
@@ -671,14 +721,38 @@ EOF
   trap "rm -rf '$state'" EXIT
   rotate_prepare "$state"
 
-  local i=0 name exit_code sid why
+  local i=0 name exit_code sid why target transcript
   while :; do
     name="${seq[$i]}"
     printf '%s▶ running as %s%s\n' "$C_B" "$name" "$C_0"
     sync_profile "$name"
-    rm -f "$state/limit.json" "$state/pid"
+    rm -f "$state/limit.json" "$state/switch.json" "$state/pid"
+    printf '%s\n' "$name" > "$state/current"
     run_watched "$name" "$state" "$@"
     exit_code=$?
+
+    # "/carousel:switch" asked for another profile. The rotation starts over
+    # from there, since that is where you now want to be.
+    if [ -s "$state/switch.json" ]; then
+      target=$(json_field "$state/switch.json" target)
+      [ -n "$target" ] || target=$(rotation_from "$name" | sed -n 2p)
+      profile_exists "${target:-}" || target="$name"
+      sid=$(json_field "$state/switch.json" session_id)
+      case "$sid" in *[!0-9a-fA-F-]*) sid="" ;; esac
+      transcript=$(json_field "$state/switch.json" transcript_path)
+
+      seq=()
+      while IFS= read -r p; do [ -n "$p" ] && seq+=("$p"); done <<EOF
+$(rotation_from "$target")
+EOF
+      n=${#seq[@]}
+      i=0
+
+      # A switch typed before anything else leaves no conversation to resume.
+      if [ -n "$sid" ] && [ -s "$transcript" ]; then set -- --resume "$sid"; else set --; fi
+      printf '%s↻ switching to %s and resuming the conversation%s\n' "$C_B" "$target" "$C_0"
+      continue
+    fi
 
     # No hook input means claude ended for any other reason, /exit included.
     [ -s "$state/limit.json" ] || return "$exit_code"
@@ -947,6 +1021,9 @@ When a usage limit ends a turn, "$me" and "$me <name>" resume the same
 conversation on the next profile in "$me order", starting from the one you ran.
 -p runs don't rotate. Pin a run to the profile you asked for with:
   export CAROUSEL_ROTATE=0
+
+Inside a session, "/carousel:switch <name>" carries the conversation on as
+that profile, and "/carousel:switch" alone moves to the next one in the order.
 
 Bypass mode (--dangerously-skip-permissions) is ON by default. Turn it off with:
   export CAROUSEL_BYPASS=0
