@@ -17,7 +17,7 @@
 
 set -u
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 DEFAULT_DIR="$HOME/.claude"
 CAROUSEL_HOME="${CAROUSEL_HOME:-$HOME/.claude-carousel}"
@@ -33,9 +33,17 @@ OS="$(uname -s)"
 #   export CAROUSEL_BYPASS=0
 BYPASS="${CAROUSEL_BYPASS:-1}"
 
-# What `carousel go` sends after switching accounts, so the turn a usage limit
-# cut off carries on by itself. Set it empty to resume the conversation and
-# wait at the prompt instead:
+# Rotation: when a usage limit ends a turn, carousel resumes the same
+# conversation on the next profile in the rotation order. Every interactive run
+# does this, "carousel <name>" included, starting from that profile. -p runs
+# never do, since a script expects one process and one answer. To pin a run to
+# the profile you asked for:
+#   export CAROUSEL_ROTATE=0
+ROTATE="${CAROUSEL_ROTATE:-1}"
+
+# What carousel sends after switching accounts, so the turn a usage limit cut
+# off carries on by itself. Set it empty to resume the conversation and wait at
+# the prompt instead:
 #   export CAROUSEL_RESUME_PROMPT=
 RESUME_PROMPT="${CAROUSEL_RESUME_PROMPT-You were cut off by a usage limit. Continue where you left off.}"
 
@@ -440,6 +448,14 @@ has_permission_flag() {
   return 1
 }
 
+is_print_mode() {
+  local a
+  for a in "$@"; do
+    case "$a" in -p|--print) return 0 ;; esac
+  done
+  return 1
+}
+
 cmd_run() {
   # A first argument that looks like a flag is always meant for Claude Code,
   # with no exceptions: "carousel --resume" runs the default profile and
@@ -453,6 +469,12 @@ cmd_run() {
     *)     name="$1"; shift ;;
   esac
   profile_exists "$name" || die "profile '$name' does not exist. See: carousel ls"
+
+  if [ "$ROTATE" = "1" ] && ! is_print_mode "$@"; then
+    run_rotating "$name" "$@"
+    return $?
+  fi
+
   sync_profile "$name"
 
   local extra=""
@@ -539,7 +561,7 @@ cmd_rm() {
 
 cmd_order() {
   if [ "$#" -eq 0 ]; then
-    printf 'rotation order used by "carousel go":\n'
+    printf 'rotation order (a usage limit moves a run to the next one):\n'
     get_order | nl -ba -w2 -s'. '
     return
   fi
@@ -553,7 +575,7 @@ cmd_order() {
   printf '%s✓%s rotation order set: %s\n' "$C_G" "$C_0" "$*"
 }
 
-# --- rotation-aware run ("go") ------------------------------------------------
+# --- rotation ------------------------------------------------------------------
 # Rotation hangs off Claude Code's own StopFailure hook, which fires when a turn
 # ends on an API error and names the error. It replaced grepping a pty capture
 # of the screen after claude exited, which could never work: the interactive UI
@@ -567,7 +589,7 @@ cmd_order() {
 # that same conversation on the next profile, which works because projects/ —
 # where transcripts live — is shared by every profile.
 
-go_prepare() {
+rotate_prepare() {
   local state="$1"
   cat > "$state/on-limit.sh" <<'EOF'
 #!/bin/sh
@@ -616,38 +638,47 @@ print(v if isinstance(v, str) else "")
 ' "$1" "$2" 2>/dev/null
 }
 
-cmd_go() {
-  local order_list; order_list=$(get_order)
-  [ -n "$order_list" ] || die "no profiles to rotate through. Run: carousel add <name>"
-
-  local cur; cur=$(get_default)
-  local -a order=()
-  while IFS= read -r l; do order+=("$l"); done <<EOF
-$order_list
+rotation_from() {
+  # Prints the profiles to try, one per line: $1 first, then the ones after it
+  # in the rotation order, wrapping around to those before it. A profile left
+  # out of the order still runs first when you ask for it by name.
+  local start="$1" order p seen=0 after="" before=""
+  order=$(get_order)
+  printf '%s\n' "$start"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ "$p" = "$start" ]; then seen=1; continue; fi
+    profile_exists "$p" || continue
+    if [ "$seen" = 1 ]; then after="$after$p"$'\n'; else before="$before$p"$'\n'; fi
+  done <<EOF
+$order
 EOF
+  printf '%s%s' "$after" "$before"
+}
 
-  local n=${#order[@]}
-  local start_idx=0 i
-  for i in "${!order[@]}"; do
-    [ "${order[$i]}" = "$cur" ] && { start_idx=$i; break; }
-  done
+run_rotating() {
+  local start="$1"; shift
+
+  local -a seq=()
+  local p
+  while IFS= read -r p; do [ -n "$p" ] && seq+=("$p"); done <<EOF
+$(rotation_from "$start")
+EOF
+  local n=${#seq[@]}
 
   local state; state=$(mktemp -d "${TMPDIR:-/tmp}/carousel.XXXXXX") || die "could not create a temp directory"
   # shellcheck disable=SC2064
   trap "rm -rf '$state'" EXIT
-  go_prepare "$state"
+  rotate_prepare "$state"
 
-  local tries=0 sid why
-  while [ "$tries" -lt "$n" ]; do
-    local idx=$(( (start_idx + tries) % n ))
-    local name="${order[$idx]}"
-    if ! profile_exists "$name"; then tries=$((tries + 1)); continue; fi
-
+  local i=0 name exit_code sid why
+  while :; do
+    name="${seq[$i]}"
     printf '%s▶ running as %s%s\n' "$C_B" "$name" "$C_0"
     sync_profile "$name"
     rm -f "$state/limit.json" "$state/pid"
     run_watched "$name" "$state" "$@"
-    local exit_code=$?
+    exit_code=$?
 
     # No hook input means claude ended for any other reason, /exit included.
     [ -s "$state/limit.json" ] || return "$exit_code"
@@ -661,17 +692,22 @@ EOF
     if [ -n "$sid" ]; then set -- --resume "$sid"; else set -- --continue; fi
     [ -n "$RESUME_PROMPT" ] && set -- "$@" "$RESUME_PROMPT"
 
-    tries=$((tries + 1))
-    if [ "$tries" -ge "$n" ]; then
+    i=$((i + 1))
+    if [ "$i" -ge "$n" ]; then
       printf '%s✗%s every profile in rotation has hit a limit\n' "$C_R" "$C_0" >&2
       [ -n "$sid" ] && printf '  pick the conversation up later with: carousel --resume %s\n' "$sid" >&2
       return 1
     fi
-    local next="${order[$(( (start_idx + tries) % n ))]}"
     printf '%s⚠ %s: %s%s\n' "$C_Y" "$name" "${why:-rate limit}" "$C_0"
-    printf '%s  switching to %s and resuming the conversation in 2s (Ctrl-C to stop)%s\n' "$C_Y" "$next" "$C_0"
+    printf '%s  switching to %s and resuming the conversation in 2s (Ctrl-C to stop)%s\n' "$C_Y" "${seq[$i]}" "$C_0"
     sleep 2
   done
+}
+
+cmd_go() {
+  # From when only "go" rotated. Plain "carousel" does the same now; "go" is
+  # kept so it still works, and rotates even with CAROUSEL_ROTATE=0.
+  run_rotating "$(get_default)" "$@"
 }
 
 # --- shell alias management --------------------------------------------------
@@ -836,10 +872,15 @@ cmd_doctor() {
   printf 'OS            : %s\n' "$OS"
   printf 'shell         : %s\n' "${BASH_VERSION:+bash $BASH_VERSION}"
   printf 'claude binary : %s\n' "$(command -v "$CLAUDE_BIN" 2>/dev/null || echo 'NOT FOUND on PATH')"
-  if [ -n "$RESUME_PROMPT" ]; then
-    printf 'go resumes    : by sending "%s" (CAROUSEL_RESUME_PROMPT= to wait at the prompt)\n' "$RESUME_PROMPT"
+  if [ "$ROTATE" = "1" ]; then
+    printf 'rotation      : on, for every interactive run (set CAROUSEL_ROTATE=0 to turn off; -p runs never rotate)\n'
   else
-    printf 'go resumes    : at the prompt, sending nothing\n'
+    printf 'rotation      : off (only "carousel go" rotates)\n'
+  fi
+  if [ -n "$RESUME_PROMPT" ]; then
+    printf 'on a switch   : resumes by sending "%s" (CAROUSEL_RESUME_PROMPT= to wait at the prompt)\n' "$RESUME_PROMPT"
+  else
+    printf 'on a switch   : resumes at the prompt, sending nothing\n'
   fi
   case "$OS" in
     Darwin) printf 'credentials   : macOS Keychain, per CLAUDE_CONFIG_DIR (handled automatically)\n' ;;
@@ -877,9 +918,8 @@ usage() {
   usage_row "$me [claude args...]" "$w" "ditto — every -flag goes to claude"
   usage_row "$me use <name>"      "$w" "set the default profile"
   usage_row "$me whoami"          "$w" "show which profile the current shell is in"
-  usage_row "$me order [names...]" "$w" "view/set the rotation order for \"go\""
-  usage_row "$me go [args...]"     "$w" "run, and on a usage limit resume the same"
-  usage_row ""                    "$w" "conversation on the next profile"
+  usage_row "$me order [names...]" "$w" "view/set the order a usage limit rotates through"
+  usage_row "$me go [args...]"     "$w" "same as \"$me\", and rotates even with CAROUSEL_ROTATE=0"
   usage_row "$me sync [name]"     "$w" "re-link shared plugins/settings to ~/.claude"
   usage_row "$me rm <name>"       "$w" "remove a profile"
   usage_row "$me alias [name]"    "$w" "register/change a short shell alias (--remove to undo)"
@@ -891,7 +931,7 @@ usage() {
 
 
   if [ "$me" = "carousel" ]; then
-    printf '\nTyping "carousel" gets old — "carousel alias cc" makes "cc go" work.\n'
+    printf '\nTyping "carousel" gets old — "carousel alias cc" makes "cc" work.\n'
   fi
 
   cat <<EOF
@@ -902,6 +942,11 @@ carousel's own help and version are "$me help" and "$me version".
 
 Your existing Claude Code login is always available as the "default" profile —
 nothing to migrate, no re-login needed for the account you already use.
+
+When a usage limit ends a turn, "$me" and "$me <name>" resume the same
+conversation on the next profile in "$me order", starting from the one you ran.
+-p runs don't rotate. Pin a run to the profile you asked for with:
+  export CAROUSEL_ROTATE=0
 
 Bypass mode (--dangerously-skip-permissions) is ON by default. Turn it off with:
   export CAROUSEL_BYPASS=0
