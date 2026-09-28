@@ -20,7 +20,7 @@
 
 **一个 bash 脚本，零依赖。** 并行使用多个 Claude Code 账号——其中一个触及用量上限时，也能继续干活。
 
-`cc go` 会启动 Claude Code；一旦某一轮因用量上限而中断，就自动在下一个账号上接着同一个对话继续。
+`cc` 会启动 Claude Code；一旦某一轮因用量上限而中断，就自动在下一个账号上接着同一个对话继续。
 没有要编译的东西，没有常驻守护进程，也没有需要手改的配置文件——只要 bash 和你已经装好的 `claude` CLI。
 
 ```console
@@ -31,7 +31,7 @@ $ cc ls
    work           me@company.com                 /Users/me/.claude-carousel/profiles/work
    oss            me+oss@personal.dev            /Users/me/.claude-carousel/profiles/oss
 
-$ cc go
+$ cc
 ▶ running as default
 ⚠ default: You've hit your session limit · resets 3pm
   switching to work and resuming the conversation in 2s (Ctrl-C to stop)
@@ -50,7 +50,7 @@ $ cc go
 - **无需迁移。** 你现在登录的账号本身就是 `default` 配置。一切照旧，而且从不劫持或包装 `claude` 命令本身。
 - **凭据仍留在操作系统安排的位置。** carousel 不会读取、写入、复制或保存你的 token。它只是把 `CLAUDE_CONFIG_DIR` 指向各配置独立的目录，其余交给 Claude Code 自己的 `/login` 处理——macOS 用钥匙串，Linux 用本地文件。
 - **不重复占用磁盘。** `plugins/`、`skills/`、`projects/` 都软链接回原本的 `~/.claude`，所以多一个配置的成本是几十 KB，而不是 800 MB。
-- **rate limit 轮换**内置在同一个脚本里，而不是另一个需要记住的模式。
+- **rate limit 轮换**对每次运行都生效，而不是另一个需要记住的模式。
 
 ## 安装
 
@@ -66,7 +66,7 @@ install -m 755 claude-carousel/bin/carousel ~/.local/bin/carousel   # PATH 上�
 ```
 
 依赖要求：bash 3.2 及以上、`python3`（macOS 自带，仅用于从 Claude Code 的 JSON 中读取账号邮箱，以及
-`cc go` 要恢复的会话 id）、`claude` CLI。
+切换时要恢复的会话 id）、`claude` CLI。
 
 ## 快速开始
 
@@ -79,8 +79,7 @@ cc work                # 以 "work" 身份运行 Claude Code
 cc                     # 以默认配置运行
 cc use work            # 把 "work" 设为默认
 
-cc order default work  # "go" 的轮换顺序
-cc go                  # 运行；触及上限就自动换下一个账号
+cc order default work  # 触及上限时的轮换顺序
 ```
 
 开两个终端就能同时使用两个账号。每个配置都有各自的凭据槽位，所以会话之间不会互相抢 token。
@@ -92,13 +91,13 @@ cc go                  # 运行；触及上限就自动换下一个账号
 | `cc ls` | 列出各配置及其登录的账号 |
 | `cc add <名称>` | 创建配置 |
 | `cc login <名称>` | 为该配置执行 Claude Code 登录流程 |
-| `cc <名称> [参数…]` | 以该配置运行 Claude Code（额外参数原样传递） |
+| `cc <名称> [参数…]` | 以该配置运行 Claude Code，触及上限时从它开始轮换（额外参数原样传递） |
 | `cc` | 以默认配置运行 |
 | `cc [claude 参数…]` | 以默认配置运行 —— `-` 开头的参数一律交给 `claude` |
 | `cc use <名称>` | 设置默认配置 |
 | `cc whoami` | 查看当前 shell 处于哪个配置 |
-| `cc order [名称…]` | 查看或设置轮换顺序 |
-| `cc go [参数…]` | 运行；触及用量上限时在下一个配置上接着同一个对话 |
+| `cc order [名称…]` | 查看或设置触及上限时的轮换顺序 |
+| `cc go [参数…]` | 与 `cc` 相同，即使 `CAROUSEL_ROTATE=0` 也会轮换 |
 | `cc sync [名称]` | 重新链接来自 `~/.claude` 的共享插件与设置 |
 | `cc rm <名称>` | 删除配置（只解除软链接，原文件不动） |
 | `cc alias [名称]` | 注册或修改简短的 shell 别名（`--remove` 撤销） |
@@ -174,7 +173,10 @@ rename 会把软链接替换成普通文件。但复制带来了更糟的问题�
 
 ## 关于 rate limit 轮换，说实话
 
-`cc go` 不读屏幕。它只为这一次运行注册一个 `StopFailure` hook（通过 `--settings` 传入，所以
+所有交互式运行都会轮换——`cc`、`cc <名称>`、`cc go` 都一样。从你指定的配置开始（单独的 `cc`
+就是默认配置），按 `cc order` 往下切换，到末尾再回到开头。
+
+这一过程不读屏幕。它只为这一次运行注册一个 `StopFailure` hook（通过 `--settings` 传入，所以
 你的设置文件一个都不会改）。当某一轮因 API 错误而结束时，Claude Code 会调用这个 hook 并告知是哪种
 错误；carousel 等的是其中的 `rate_limit`。hook 一触发，carousel 就会：
 
@@ -197,6 +199,8 @@ export CAROUSEL_RESUME_PROMPT="continue" # 或者用你自己的措辞
    不会再传一遍。
 2. **需要有 `StopFailure` hook 的较新版 Claude Code。** 没有的话，上限提示照常出现，但不会切换。
 3. **所有配置都触及上限时会停下**并打印会话 id，等上限重置后用 `cc --resume <id>` 接着来。
+4. **`-p` 运行不轮换。** 脚本期望一个进程、一个答案，所以 `cc -p …` 会直接交给 Claude Code。
+5. **想停留在你指定的配置上**，就 `export CAROUSEL_ROTATE=0`。即便如此，`cc go` 仍会轮换。
 
 ## bypass 模式
 
@@ -217,7 +221,6 @@ carousel 不认识的参数会原样交给 `claude`，你惯用的那些 flag �
 cc --resume                 # 以默认配置执行 claude --resume
 cc -p "总结一下这个仓库"      # claude -p "…"
 cc work --model opus        # 以 "work" 配置
-cc go --resume              # 触及用量上限时切换账号
 ```
 
 没有例外：**以 `-` 开头的一律属于 Claude Code。** carousel 的命令全是以空格分隔的普通词，

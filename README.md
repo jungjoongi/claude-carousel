@@ -21,7 +21,7 @@
 **One bash script, zero dependencies.** Run several Claude Code accounts side by side —
 and keep working when one hits its usage limit.
 
-`cc go` launches Claude Code, and when a usage limit ends a turn it picks the same
+`cc` launches Claude Code, and when a usage limit ends a turn it picks the same
 conversation up on your next account, automatically. Nothing to build, no daemon, no config
 file to hand-edit — just bash and the `claude` CLI you already have.
 
@@ -33,7 +33,7 @@ $ cc ls
    work           me@company.com                 /Users/me/.claude-carousel/profiles/work
    oss            me+oss@personal.dev            /Users/me/.claude-carousel/profiles/oss
 
-$ cc go
+$ cc
 ▶ running as default
 ⚠ default: You've hit your session limit · resets 3pm
   switching to work and resuming the conversation in 2s (Ctrl-C to stop)
@@ -52,7 +52,7 @@ The entire tool is a single ~500-line bash script. There is nothing else to it.
 - **Nothing to migrate.** The account you're logged into right now is the `default` profile. It keeps working exactly as before, and `claude` on its own is never shadowed or wrapped.
 - **Credentials stay where the OS wants them.** carousel never reads, writes, copies, or stores your tokens. It points `CLAUDE_CONFIG_DIR` at a per-profile directory and lets Claude Code's own `/login` handle the rest — Keychain on macOS, a local file on Linux.
 - **No duplicated disk.** `plugins/`, `skills/`, and `projects/` are symlinked back to your main `~/.claude`, so a second profile costs kilobytes, not the ~800 MB a full plugin tree does.
-- **Rate-limit rotation** built into the same script, rather than a separate mode you have to remember.
+- **Rate-limit rotation** on every run, rather than a separate mode you have to remember.
 
 ## Install
 
@@ -67,7 +67,7 @@ git clone https://github.com/jungjoongi/claude-carousel.git
 install -m 755 claude-carousel/bin/carousel ~/.local/bin/carousel   # anywhere on your PATH
 ```
 
-Requirements: bash 3.2+, `python3` (ships with macOS; used only to read small bits of Claude Code's JSON — the account email, and the session id `cc go` resumes), and the `claude` CLI.
+Requirements: bash 3.2+, `python3` (ships with macOS; used only to read small bits of Claude Code's JSON — the account email, and the session id a switch resumes), and the `claude` CLI.
 
 ## Quickstart
 
@@ -80,8 +80,7 @@ cc work                # run Claude Code as "work"
 cc                     # run the default profile
 cc use work            # make "work" the default
 
-cc order default work  # rotation order for "go"
-cc go                  # run, hopping to the next account on a rate limit
+cc order default work  # the order a usage limit rotates through
 ```
 
 Run two accounts at the same time by opening two terminals — each profile has its own
@@ -94,13 +93,13 @@ credential slot, so the sessions don't fight over a token.
 | `cc ls` | List profiles with the account each is logged into |
 | `cc add <name>` | Create a profile |
 | `cc login <name>` | Open Claude Code's login flow for a profile |
-| `cc <name> [args…]` | Run Claude Code as that profile (extra args pass through) |
+| `cc <name> [args…]` | Run Claude Code as that profile, rotating from it on a usage limit (extra args pass through) |
 | `cc` | Run the default profile |
 | `cc [claude args…]` | Run the default profile — every `-`flag goes to `claude` |
 | `cc use <name>` | Set the default profile |
 | `cc whoami` | Which profile is the current shell in? |
-| `cc order [names…]` | View or set the rotation order |
-| `cc go [args…]` | Run; on a usage limit, resume the same conversation on the next profile |
+| `cc order [names…]` | View or set the order a usage limit rotates through |
+| `cc go [args…]` | Same as `cc`, and rotates even with `CAROUSEL_ROTATE=0` |
 | `cc sync [name]` | Re-link shared plugins/settings from `~/.claude` |
 | `cc rm <name>` | Delete a profile (symlinks unlinked; originals untouched) |
 | `cc alias [name]` | Register or change a short shell alias (`--remove` to undo) |
@@ -183,7 +182,11 @@ shared configuration.
 
 ## Rate-limit rotation, honestly
 
-`cc go` doesn't read the screen. It registers a `StopFailure` hook for that run only
+Every interactive run rotates — `cc`, `cc <name>` and `cc go` alike. It starts on the
+profile you asked for (the default, for plain `cc`) and moves through `cc order` from there,
+wrapping around.
+
+carousel doesn't read the screen to do it. It registers a `StopFailure` hook for that run only
 (through `--settings`, so none of your settings files change). Claude Code fires that hook
 when a turn ends on an API error and says which error it was; carousel listens for
 `rate_limit`. When it fires, carousel:
@@ -210,6 +213,10 @@ Caveats worth stating plainly:
    limit shows up as usual and nothing switches.
 3. **When every profile is limited, it stops** and prints the session id, so you can
    `cc --resume <id>` once a limit resets.
+4. **`-p` runs don't rotate.** A script expects one process and one answer, so `cc -p …`
+   goes straight to Claude Code.
+5. **To stay on the profile you named**, `export CAROUSEL_ROTATE=0`. `cc go` still rotates
+   with it set.
 
 ## Bypass mode
 
@@ -232,7 +239,6 @@ use keep working:
 cc --resume                 # claude --resume, as the default profile
 cc -p "summarise this repo" # claude -p "…"
 cc work --model opus        # …as the "work" profile
-cc go --resume              # …switching accounts on a usage limit
 ```
 
 There are no exceptions: **anything starting with `-` belongs to Claude Code.** Every

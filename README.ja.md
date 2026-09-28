@@ -21,7 +21,7 @@
 **bash スクリプト 1 本、依存ゼロ。** 複数の Claude Code アカウントを並行して使い、ひとつが
 利用上限に達しても作業を続けられます。
 
-`cc go` は Claude Code を起動し、利用上限でターンが終わると、次のアカウントで同じ会話を
+`cc` は Claude Code を起動し、利用上限でターンが終わると、次のアカウントで同じ会話を
 自動的に続けます。ビルドするものも、常駐デーモンも、手で編集する設定ファイルも
 ありません — bash とすでに入っている `claude` CLI だけで動きます。
 
@@ -33,7 +33,7 @@ $ cc ls
    work           me@company.com                 /Users/me/.claude-carousel/profiles/work
    oss            me+oss@personal.dev            /Users/me/.claude-carousel/profiles/oss
 
-$ cc go
+$ cc
 ▶ running as default
 ⚠ default: You've hit your session limit · resets 3pm
   switching to work and resuming the conversation in 2s (Ctrl-C to stop)
@@ -52,7 +52,7 @@ $ cc go
 - **移行作業なし。** いま使っているログインがそのまま `default` プロファイルになります。従来どおり動き、`claude` コマンド自体を横取りしたりラップしたりはしません。
 - **認証情報は OS が置く場所のまま。** carousel はトークンを読み書き・コピー・保存しません。`CLAUDE_CONFIG_DIR` をプロファイルごとのディレクトリに向けるだけで、あとは Claude Code の `/login` が処理します — macOS はキーチェーン、Linux はローカルファイル。
 - **ディスクの重複なし。** `plugins/`、`skills/`、`projects/` は元の `~/.claude` へシンボリックリンクされるので、プロファイルを 1 つ増やすコストは 800 MB ではなく数十 KB です。
-- **rate limit ローテーション**が別モードではなく同じスクリプトに入っています。
+- **rate limit ローテーション**が別モードではなく、すべての起動で有効です。
 
 ## インストール
 
@@ -68,7 +68,7 @@ install -m 755 claude-carousel/bin/carousel ~/.local/bin/carousel   # PATH 上�
 ```
 
 必要なもの: bash 3.2 以上、`python3`（macOS に標準搭載。Claude Code の JSON からアカウントの
-メールアドレスと、`cc go` が再開するセッション id を読むためだけに使います）、そして `claude` CLI。
+メールアドレスと、切り替え時に再開するセッション id を読むためだけに使います）、そして `claude` CLI。
 
 ## クイックスタート
 
@@ -81,8 +81,7 @@ cc work                # "work" として Claude Code を起動
 cc                     # デフォルトのプロファイルで起動
 cc use work            # "work" をデフォルトに設定
 
-cc order default work  # "go" が回る順番
-cc go                  # 上限に達したら次のアカウントへ自動で切り替え
+cc order default work  # 上限に達したときに回る順番
 ```
 
 ターミナルを 2 つ開けば、2 つのアカウントを同時に使えます。プロファイルごとに認証スロットが
@@ -95,13 +94,13 @@ cc go                  # 上限に達したら次のアカウントへ自動で�
 | `cc ls` | プロファイル一覧と、それぞれがログインしているアカウントを表示 |
 | `cc add <名前>` | プロファイルを作成 |
 | `cc login <名前>` | そのプロファイルで Claude Code のログイン手順を実行 |
-| `cc <名前> [引数…]` | そのプロファイルで Claude Code を起動（追加引数はそのまま渡す） |
+| `cc <名前> [引数…]` | そのプロファイルで Claude Code を起動し、上限に達したらそこからローテーション（追加引数はそのまま渡す） |
 | `cc` | デフォルトのプロファイルで起動 |
 | `cc [claude の引数…]` | デフォルトのプロファイルで起動 — `-` で始まる引数はすべて `claude` へ |
 | `cc use <名前>` | デフォルトのプロファイルを設定 |
 | `cc whoami` | いまのシェルがどのプロファイルかを表示 |
-| `cc order [名前…]` | ローテーション順の確認・設定 |
-| `cc go [引数…]` | 起動し、利用上限に達したら次のプロファイルで同じ会話を続ける |
+| `cc order [名前…]` | 上限に達したときに回る順番の確認・設定 |
+| `cc go [引数…]` | `cc` と同じ。`CAROUSEL_ROTATE=0` でもローテーションする |
 | `cc sync [名前]` | `~/.claude` の共有プラグイン・設定を再リンク |
 | `cc rm <名前>` | プロファイルを削除（シンボリックリンクのみ解除、元は無傷） |
 | `cc alias [名前]` | 短いシェル alias を登録・変更（`--remove` で解除） |
@@ -182,7 +181,11 @@ atomic write で書き直すことがあり、rename がシンボリックリン
 
 ## rate limit ローテーションについて、正直に
 
-`cc go` は画面を読みません。その実行に限って `StopFailure` フックを登録します（`--settings`
+対話的な起動はすべてローテーションします — `cc`、`cc <名前>`、`cc go` のどれでも。指定した
+プロファイル（ただの `cc` ならデフォルト）から始まり、`cc order` に沿って次へ進み、最後まで
+行ったら先頭に戻ります。
+
+そのために画面を読むことはしません。その実行に限って `StopFailure` フックを登録します（`--settings`
 で渡すので、設定ファイルは一切変わりません）。Claude Code は API エラーでターンが終わると、
 どのエラーだったかを添えてこのフックを呼び、carousel はそのうち `rate_limit` を待ちます。
 フックが呼ばれると carousel は:
@@ -209,6 +212,10 @@ export CAROUSEL_RESUME_PROMPT="continue" # または好きな文言で
    いつもどおり出るだけで切り替えは起きません。
 3. **すべてのプロファイルが上限に達したら止まり**、セッション id を表示します。上限が
    リセットされたら `cc --resume <id>` で続けられます。
+4. **`-p` の実行はローテーションしません。** スクリプトはプロセス 1 つ・答え 1 つを前提に
+   しているので、`cc -p …` はそのまま Claude Code に渡ります。
+5. **指定したプロファイルに留まりたいときは** `export CAROUSEL_ROTATE=0`。それでも `cc go`
+   はローテーションします。
 
 ## bypass モード
 
@@ -230,7 +237,6 @@ carousel が知らない引数はそのまま `claude` に渡されるので、�
 cc --resume                 # デフォルトのプロファイルで claude --resume
 cc -p "このリポジトリを要約して"  # claude -p "…"
 cc work --model opus        # "work" プロファイルで
-cc go --resume              # 利用上限に達したらアカウントを切り替え
 ```
 
 例外はありません。**`-` で始まるものはすべて Claude Code のものです。** carousel の
