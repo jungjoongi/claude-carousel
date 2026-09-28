@@ -204,6 +204,32 @@ out=$("$CAROUSEL" 2>&1); code=$?
 check "launched once"                        "$(count)" "1"
 check "hook said nothing"                    "$(wc -c < "$T/hookout" | tr -d ' ')" "0"
 
+echo "a folder trusted in one profile is trusted in the one launched"
+mkdir -p "$T/work/sub"
+W=$(cd "$T/work/sub" && pwd -P)
+trust() { python3 -c '
+import json, sys
+path, d = sys.argv[1], sys.argv[2]
+print(bool(((json.load(open(path)).get("projects") or {}).get(d) or {}).get("hasTrustDialogAccepted")))
+' "$1" "$W"; }
+printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}' "$(dirname "$W")" > "$T/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"a@example.com"}}' > "$T/.claude-carousel/profiles/a/.claude.json"
+reset
+( cd "$W" && CAROUSEL_ROTATE=0 "$CAROUSEL" a >/dev/null 2>&1 )
+check "trusted via the default's parent folder" "$(trust "$T/.claude-carousel/profiles/a/.claude.json")" "True"
+check "the rest of the file is kept"  "$(has "$(cat "$T/.claude-carousel/profiles/a/.claude.json")" "a@example.com")" "yes"
+printf '{}' > "$T/.claude-carousel/profiles/b/.claude.json"
+reset
+type_in "a|/carousel:switch b"
+( cd "$W" && "$CAROUSEL" a >/dev/null 2>&1 )
+check "a switch carries it to the next profile" "$(trust "$T/.claude-carousel/profiles/b/.claude.json")" "True"
+printf '{}' > "$T/.claude.json"
+printf '{}' > "$T/.claude-carousel/profiles/a/.claude.json"
+printf '{}' > "$T/.claude-carousel/profiles/b/.claude.json"
+reset
+( cd "$W" && CAROUSEL_ROTATE=0 "$CAROUSEL" a >/dev/null 2>&1 )
+check "a folder nobody trusts is left to ask" "$(cat "$T/.claude-carousel/profiles/a/.claude.json")" "{}"
+
 echo "temp state is cleaned up"
 check "nothing left in TMPDIR" "$(ls -A "$TMPDIR" | wc -l | tr -d ' ')" "0"
 
