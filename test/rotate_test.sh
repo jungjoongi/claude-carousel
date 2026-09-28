@@ -1,5 +1,6 @@
 #!/bin/bash
-# Tests for rotating to the next profile on a usage limit.
+# Tests for rotating to the next profile on a usage limit, and for switching
+# profile from inside a session with /carousel:switch.
 #
 # Runs carousel against a throwaway $HOME with a stand-in for claude that plays
 # out a usage limit the way Claude Code does: it runs the StopFailure hook it
@@ -34,15 +35,32 @@ launch() { sed -n "${1}p" "$T/launches"; }
 profiles() { cut -d'|' -f1 "$T/launches" | tr '\n' ' '; }
 count()  { wc -l < "$T/launches" | tr -d ' '; }
 
-# Logs "<profile>|<args>" for every launch. A profile listed in $T/limited hits
-# a limit; anything else exits with $FAKE_EXIT.
+# Logs "<profile>|<args>" for every launch. A "<profile>|<prompt>" line in
+# $T/typed is typed into that profile's first launch: it goes through the
+# UserPromptSubmit hook, whose output lands in $T/hookout. A profile listed in
+# $T/limited then hits a limit; anything else exits with $FAKE_EXIT.
 cat > "$T/claude" <<EOF
 #!/bin/bash
 prof=default
 [ -n "\${CLAUDE_CONFIG_DIR:-}" ] && prof=\$(basename "\$CLAUDE_CONFIG_DIR")
 printf '%s|%s\n' "\$prof" "\$*" >> "$T/launches"
-settings="" prev=""
-for a in "\$@"; do [ "\$prev" = "--settings" ] && settings="\$a"; prev="\$a"; done
+settings="" plugin="" prev=""
+for a in "\$@"; do
+  [ "\$prev" = "--settings" ] && settings="\$a"
+  [ "\$prev" = "--plugin-dir" ] && plugin="\$a"
+  prev="\$a"
+done
+if line=\$(grep -m1 "^\$prof|" "$T/typed" 2>/dev/null); then
+  grep -vxF "\$line" "$T/typed" > "$T/typed.new"; mv "$T/typed.new" "$T/typed"
+  [ -f "\$plugin/commands/switch.md" ] || exit 98
+  cmd=\$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])
+' "\$settings") || exit 99
+  # The hook stops this process when it switches, as it stops claude.
+  printf '{"session_id":"$SID","transcript_path":"%s","hook_event_name":"UserPromptSubmit","prompt":"%s"}' \
+    "\${FAKE_TRANSCRIPT:-$T/transcript.jsonl}" "\${line#*|}" | sh -c "\$cmd" >> "$T/hookout"
+fi
 if grep -qx "\$prof" "$T/limited" 2>/dev/null; then
   cmd=\$(python3 -c '
 import json, sys
@@ -61,7 +79,9 @@ chmod +x "$T/claude"
 "$CAROUSEL" add a >/dev/null 2>&1
 "$CAROUSEL" add b >/dev/null 2>&1
 
-reset() { : > "$T/launches"; printf '%s\n' "$@" > "$T/limited"; }
+reset() { : > "$T/launches"; : > "$T/typed"; : > "$T/hookout"; printf '%s\n' "$@" > "$T/limited"; }
+type_in() { printf '%s\n' "$@" > "$T/typed"; }
+echo '{}' > "$T/transcript.jsonl"
 
 echo "a limit resumes the same conversation on the next profile"
 "$CAROUSEL" order default a b >/dev/null
@@ -131,6 +151,58 @@ check "ran as a"                 "$(profiles)" "a "
 reset default
 out=$(CAROUSEL_ROTATE=0 "$CAROUSEL" go 2>&1); code=$?
 check "go rotated anyway"        "$(profiles)" "default a "
+
+echo "/carousel:switch <name> resumes the conversation as that profile"
+"$CAROUSEL" order default a b >/dev/null
+reset
+type_in "default|/carousel:switch b"
+out=$("$CAROUSEL" --model opus "fix the bug" 2>&1); code=$?
+check "exits cleanly"                        "$code" "0"
+check "ran default, then b"                  "$(profiles)" "default b "
+check "first launch loads the command"       "$(has "$(launch 1)" "--plugin-dir")" "yes"
+check "b resumes the session"                "$(has "$(launch 2)" "--resume $SID")" "yes"
+check "...and waits at the prompt"           "$(has "$(launch 2)" "$PROMPT_DEFAULT")" "no"
+check "...without the first launch's args"   "$(has "$(launch 2)" "fix the bug")" "no"
+check "says where it switched to"            "$(has "$out" "switching to b")" "yes"
+
+echo "/carousel:switch alone moves to the next profile in order"
+reset
+type_in "a|/carousel:switch"
+out=$("$CAROUSEL" a 2>&1); code=$?
+check "ran a, then b"                        "$(profiles)" "a b "
+
+echo "a limit after a switch rotates on from the new profile"
+reset b
+type_in "default|/carousel:switch b"
+out=$("$CAROUSEL" 2>&1); code=$?
+check "ran default, b, then default again"   "$(profiles)" "default b default "
+check "the limit resume sends the prompt"    "$(has "$(launch 3)" "--resume $SID $PROMPT_DEFAULT")" "yes"
+
+echo "a switch before the first message starts the new profile fresh"
+reset
+type_in "default|/carousel:switch a"
+out=$(FAKE_TRANSCRIPT="$T/none.jsonl" "$CAROUSEL" 2>&1); code=$?
+check "ran default, then a"                  "$(profiles)" "default a "
+check "nothing to resume"                    "$(has "$(launch 2)" "--resume")" "no"
+
+echo "a switch that can't happen is refused in the session"
+reset
+type_in "default|/carousel:switch nope"
+out=$("$CAROUSEL" 2>&1); code=$?
+check "unknown profile: stays put"           "$(profiles)" "default "
+check "...and says which profiles exist"     "$(has "$(cat "$T/hookout")" "no profile named 'nope'. Profiles: default, a, b")" "yes"
+reset
+type_in "a|/carousel:switch a"
+out=$("$CAROUSEL" a 2>&1); code=$?
+check "same profile: stays put"              "$(profiles)" "a "
+check "...and says so"                       "$(has "$(cat "$T/hookout")" "already running as a")" "yes"
+
+echo "other prompts pass the hook untouched"
+reset
+type_in "default|/carousel:switchy b"
+out=$("$CAROUSEL" 2>&1); code=$?
+check "launched once"                        "$(count)" "1"
+check "hook said nothing"                    "$(wc -c < "$T/hookout" | tr -d ' ')" "0"
 
 echo "temp state is cleaned up"
 check "nothing left in TMPDIR" "$(ls -A "$TMPDIR" | wc -l | tr -d ' ')" "0"
