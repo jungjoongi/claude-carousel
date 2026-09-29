@@ -43,6 +43,18 @@ done
 check "plugins is still a symlink"              "$(islink "$P/tech/plugins")" "yes"
 check "settings.local.json is seeded as a file" "$(isfile "$P/tech/settings.local.json")" "yes"
 
+echo "the account file is reachable where status lines look for it"
+check "tech.json links to the profile's .claude.json" "$(readlink "$P/tech.json")" "$P/tech/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"tech@example.com"}}\n' > "$P/tech/.claude.json"
+check "it reads through once the file exists" "$(grep -c tech@example.com "$P/tech.json")" "1"
+check "ls does not mistake it for a profile" "$("$CAROUSEL" ls 2>/dev/null | grep -c 'tech\.json')" "0"
+printf 'mine\n' > "$P/keep.json"
+mkdir "$P/keep"
+out=$("$CAROUSEL" sync keep 2>&1)
+check "a real file in the way is left alone" "$(cat "$P/keep.json")" "mine"
+check "and that is announced"                "$(printf '%s' "$out" | grep -c 'not a symlink')" "1"
+rm -rf "$P/keep" "$P/keep.json"
+
 echo "edit through a profile reaches the master"
 printf '{"enabledPlugins":{"github":true}}\n' > "$P/tech/settings.json"
 check "master no longer lists superpowers" "$(grep -c superpowers "$M/settings.json")" "0"
@@ -102,6 +114,7 @@ check "seeded from the master"  "$(grep -c enableAllProjectMcpServers "$P/tech/s
 echo "rm unlinks without following the links"
 echo y | "$CAROUSEL" rm legacy >/dev/null 2>&1
 check "profile is gone"          "$(exists "$P/legacy")" "no"
+check "its account link is gone" "$(islink "$P/legacy.json")" "no"
 check "master settings survive"  "$(exists "$M/settings.json")" "yes"
 check "master plugins survive"   "$(exists "$M/plugins")" "yes"
 check "master content survives"  "$(grep -c shared-edit "$M/settings.json")" "1"
