@@ -157,6 +157,7 @@ carousel は本質的に、その環境変数 1 つを取り巻く少しの管�
 ├── order                              ← `go` のローテーション順
 ├── alias                              ← 登録したシェル alias 名
 └── profiles/
+    ├── work.json -> work/.claude.json   ← ステータスライン（claude-hud）がここでアカウントを読む
     └── work/
         ├── .claude.json               ← このプロファイルの識別情報 + セッション状態
         ├── plugins  -> ~/.claude/plugins    (シンボリックリンク)

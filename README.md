@@ -159,6 +159,7 @@ carousel is essentially a small amount of bookkeeping around that one environmen
 ├── order                              ← rotation order for `go`
 ├── alias                              ← the shell alias you registered
 └── profiles/
+    ├── work.json -> work/.claude.json   ← status lines (claude-hud) read the account here
     └── work/
         ├── .claude.json               ← this profile's identity + session state
         ├── plugins  -> ~/.claude/plugins    (symlink)

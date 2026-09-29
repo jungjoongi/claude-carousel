@@ -153,6 +153,7 @@ carousel 本质上就是围绕这一个环境变量做的少量管理工作：
 ├── order                              ← `go` 的轮换顺序
 ├── alias                              ← 已注册的 shell 别名
 └── profiles/
+    ├── work.json -> work/.claude.json   ← 状态栏（claude-hud）从这里读取账号
     └── work/
         ├── .claude.json               ← 该配置的身份 + 会话状态
         ├── plugins  -> ~/.claude/plugins    (软链接)
