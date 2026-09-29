@@ -156,6 +156,7 @@ carousel은 본질적으로 그 환경변수 하나를 둘러싼 약간의 정�
 ├── order                              ← `go`의 로테이션 순서
 ├── alias                              ← 등록된 셸 alias 이름
 └── profiles/
+    ├── work.json -> work/.claude.json   ← 상태줄(claude-hud)이 여기서 계정을 읽음
     └── work/
         ├── .claude.json               ← 이 프로필의 신원 + 세션 상태
         ├── plugins  -> ~/.claude/plugins    (심볼릭 링크)
