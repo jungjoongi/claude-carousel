@@ -297,6 +297,19 @@ sync_profile() {
     ln -sfn "$master" "$target"
   done
 
+  # Status lines such as claude-hud look for the account at "$CLAUDE_CONFIG_DIR.json",
+  # which is where ~/.claude.json sits next to ~/.claude. A profile keeps it inside
+  # its own directory instead, so without this the status line finds no account to
+  # show. The link may dangle until the first login creates the file; that's fine.
+  target="$PROFILE_ROOT/$name.json"
+  if [ -L "$target" ]; then
+    [ "$(readlink "$target")" = "$dir/.claude.json" ] || ln -sfn "$dir/.claude.json" "$target"
+  elif [ -e "$target" ]; then
+    warn "$target is not a symlink — leaving it alone, so the status line may not show this account"
+  else
+    ln -s "$dir/.claude.json" "$target"
+  fi
+
   # An older carousel shared these, so unpick any link it left behind and give
   # the profile back a file of its own to diverge in.
   for item in $LOCAL_FILES; do
@@ -605,6 +618,7 @@ cmd_rm() {
   case "$ans" in y|Y|yes|YES) ;; *) printf 'cancelled\n'; return;; esac
   local item
   for item in $SHARED_DIRS $SHARED_FILES; do [ -L "$dir/$item" ] && rm -f "$dir/$item"; done
+  [ -L "$PROFILE_ROOT/$name.json" ] && rm -f "$PROFILE_ROOT/$name.json"
   rm -rf "$dir"
   printf '%s✓%s removed\n' "$C_G" "$C_0"
 }
