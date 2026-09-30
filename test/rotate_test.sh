@@ -229,6 +229,31 @@ printf '{}' > "$T/.claude-carousel/profiles/b/.claude.json"
 reset
 ( cd "$W" && CAROUSEL_ROTATE=0 "$CAROUSEL" a >/dev/null 2>&1 )
 check "a folder nobody trusts is left to ask" "$(cat "$T/.claude-carousel/profiles/a/.claude.json")" "{}"
+printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}' "$(dirname "$W")" > "$T/.claude.json"
+rm -f "$T/.claude-carousel/profiles/a/.claude.json"
+reset
+( cd "$W" && CAROUSEL_ROTATE=0 "$CAROUSEL" a >/dev/null 2>&1 )
+check "a profile that never ran gets a config holding it" "$(trust "$T/.claude-carousel/profiles/a/.claude.json")" "True"
+check "...readable only by you" "$(stat -f %Lp "$T/.claude-carousel/profiles/a/.claude.json" 2>/dev/null || stat -c %a "$T/.claude-carousel/profiles/a/.claude.json")" "600"
+rm -f "$T/.claude-carousel/profiles/a/.claude.json"
+reset
+( cd "$W" && "$CAROUSEL" login a >/dev/null 2>&1 )
+check "login carries it too" "$(trust "$T/.claude-carousel/profiles/a/.claude.json")" "True"
+check "login runs in bypass mode" "$(launch 1)" "a|--dangerously-skip-permissions"
+reset
+( cd "$W" && CAROUSEL_BYPASS=0 "$CAROUSEL" login a >/dev/null 2>&1 )
+check "login leaves bypass off when told to" "$(launch 1)" "a|"
+mkdir -p "$W/.git"
+printf '{}' > "$T/.claude-carousel/profiles/a/.claude.json"
+reset
+( cd "$W" && CAROUSEL_ROTATE=0 "$CAROUSEL" a >/dev/null 2>&1 )
+check "a trusted parent doesn't reach into a git repo" "$(cat "$T/.claude-carousel/profiles/a/.claude.json")" "{}"
+printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}' "$(dirname "$W")" > "$T/.claude-carousel/profiles/a/.claude.json"
+printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}' "$W" > "$T/.claude.json"
+reset
+( cd "$W" && CAROUSEL_ROTATE=0 "$CAROUSEL" a >/dev/null 2>&1 )
+check "...nor stops a trusted repo reaching a profile that trusts only its parent" "$(trust "$T/.claude-carousel/profiles/a/.claude.json")" "True"
+rm -rf "$W/.git"
 
 echo "temp state is cleaned up"
 check "nothing left in TMPDIR" "$(ls -A "$TMPDIR" | wc -l | tr -d ' ')" "0"
