@@ -152,8 +152,11 @@ share_trust() {
   # including right after a switch or a rotation. When some profile trusts the
   # current folder (or a folder above it, which Claude Code also honours), mark
   # it trusted for this one too. A folder no profile trusts still gets asked.
+  #
+  # A profile that has never run has no config file yet, and that first run —
+  # usually "carousel login" right after "carousel add" — is exactly where the
+  # question would come up, so the file is created to hold the answer.
   local target; target=$(config_json "$(profile_dir "$1")")
-  [ -f "$target" ] || return 0
   local p; local -a others=()
   while IFS= read -r p; do
     [ -n "$p" ] && [ "$p" != "$1" ] && others+=("$(config_json "$(profile_dir "$p")")")
@@ -164,13 +167,29 @@ EOF
 import json, os, sys
 target, cwd, others = sys.argv[1], sys.argv[2], sys.argv[3:]
 
-def trusts(cfg, d):
+def git_root(d):
+    while True:
+        g = os.path.join(d, ".git")
+        if not os.path.islink(g) and (os.path.isdir(g) or os.path.isfile(g)):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+# Inside a git repository Claude Code stops looking at the repository root, so
+# a trusted ~/git doesn't cover ~/git/repo. Walking past it here would count
+# the folder as trusted and skip writing the entry Claude Code then asks for.
+root = git_root(cwd)
+
+def trusts(cfg):
     projects = cfg.get("projects") or {}
+    d = cwd
     while True:
         if (projects.get(d) or {}).get("hasTrustDialogAccepted"):
             return True
         parent = os.path.dirname(d)
-        if parent == d:
+        if d == root or parent == d:
             return False
         d = parent
 
@@ -181,16 +200,17 @@ def load(path):
     except Exception:
         return None
 
-cfg = load(target)
-if not isinstance(cfg, dict) or trusts(cfg, cwd):
+exists = os.path.exists(target)
+cfg = load(target) if exists else {}
+if not isinstance(cfg, dict) or trusts(cfg):
     sys.exit(0)
-if not any(isinstance(o, dict) and trusts(o, cwd) for o in map(load, others)):
+if not any(isinstance(o, dict) and trusts(o) for o in map(load, others)):
     sys.exit(0)
 cfg.setdefault("projects", {}).setdefault(cwd, {})["hasTrustDialogAccepted"] = True
 tmp = target + ".carousel-tmp"
 with open(tmp, "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
-os.chmod(tmp, os.stat(target).st_mode & 0o777)
+os.chmod(tmp, os.stat(target).st_mode & 0o777 if exists else 0o600)
 os.replace(tmp, target)
 PY
 }
@@ -491,11 +511,18 @@ cmd_login() {
   [ -n "$name" ] || die "usage: carousel login <name>"
   profile_exists "$name" || die "profile '$name' does not exist. Run: carousel add $name"
   sync_profile "$name"
+  share_trust "$name"
   printf 'Opening Claude Code for profile %s%s%s. Follow the login flow if prompted.\n' "$C_B" "$name" "$C_0"
+
+  local extra=""
+  [ "$BYPASS" = "1" ] && extra="--dangerously-skip-permissions"
+
   if [ "$name" = "default" ]; then
-    exec env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN"
+    # shellcheck disable=SC2086
+    exec env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN" $extra
   else
-    CLAUDE_CONFIG_DIR="$(profile_dir "$name")" exec "$CLAUDE_BIN"
+    # shellcheck disable=SC2086
+    CLAUDE_CONFIG_DIR="$(profile_dir "$name")" exec "$CLAUDE_BIN" $extra
   fi
 }
 
