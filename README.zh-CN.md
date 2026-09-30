@@ -226,7 +226,8 @@ hook，所以普通的 `claude` 会话里没有它。指定不存在的 profile 
 1. **只有对话会延续。** 第一次启动时给的 `--model` 等参数不会重复。
 2. **只在会轮换的运行中可用。** `CAROUSEL_ROTATE=0` 或 `-p` 运行中没有这个命令。
 3. **文件夹信任确认只出现一次，而不是每个 profile 一次。** 在任一 profile 中信任过的文件夹
-   （或其上级文件夹），在 carousel 启动的 profile 中也会标记为已信任。
+   （或其上级文件夹），在 carousel 启动的 profile 中也会标记为已信任，用 `carousel login` 首次启动
+   新 profile 时也一样。与 Claude Code 本身一致，git 仓库之上的文件夹的信任不适用于仓库内的文件夹。
 4. **Claude Code 是被停止而不是正常退出**，所以会话结束时运行的 hook 可能无法执行完。
 
 ## bypass 模式

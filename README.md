@@ -244,7 +244,9 @@ Caveats:
    `--model`, aren't repeated.
 2. **It needs a rotating run.** With `CAROUSEL_ROTATE=0`, or under `-p`, the command isn't there.
 3. **The folder-trust question is asked once, not once per profile.** A folder you trusted in
-   any profile (or a folder above it) is marked trusted in the profile carousel launches.
+   any profile (or a folder above it) is marked trusted in the profile carousel launches,
+   including a new profile's first run under `carousel login`. As in Claude Code itself, a folder
+   above a git repository doesn't count for the folders inside it.
 4. **Claude Code is stopped, not exited**, so hooks that run at session end may be cut short.
 
 ## Bypass mode
