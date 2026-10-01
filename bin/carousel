@@ -47,7 +47,7 @@ ROTATE="${CAROUSEL_ROTATE:-1}"
 #   export CAROUSEL_RESUME_PROMPT=
 RESUME_PROMPT="${CAROUSEL_RESUME_PROMPT-You were cut off by a usage limit. Continue where you left off.}"
 
-RESERVED_CMDS="ls list add login use switch whoami who sync rm remove order go doctor alias star update version help"
+RESERVED_CMDS="ls list add login use switch whoami who sync rm remove order go artifacts doctor alias star update version help"
 
 REPO_SLUG="jungjoongi/claude-carousel"
 ALIAS_FILE="$CAROUSEL_HOME/alias"
@@ -572,6 +572,14 @@ cmd_run() {
     extra="--dangerously-skip-permissions"
   fi
 
+  # A run that doesn't rotate has no settings of carousel's to ride along in, so
+  # the artifact hook gets a file of its own.
+  local artifacts; artifacts=$(artifact_hook)
+  if [ -n "$artifacts" ]; then
+    printf '{"hooks":{"PreToolUse":[%s]}}\n' "$artifacts" > "$ARTIFACT_DIR/settings.json"
+    set -- --settings "$ARTIFACT_DIR/settings.json" "$@"
+  fi
+
   if [ "$name" = "default" ]; then
     # shellcheck disable=SC2086
     exec env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN" $extra "$@"
@@ -740,8 +748,10 @@ argument-hint: "[profile]"
 carousel's hook should have handled this command before it reached you. Tell the user in one sentence that the profile switch did not happen, and do nothing else.
 EOF
   list_profiles > "$state/profiles"
+  local artifacts; artifacts=$(artifact_hook)
+  [ -n "$artifacts" ] && artifacts=",\"PreToolUse\":[$artifacts]"
   cat > "$state/settings.json" <<EOF
-{"hooks":{"StopFailure":[{"matcher":"rate_limit","hooks":[{"type":"command","command":"/bin/sh '$state/on-limit.sh'"}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/bin/sh '$state/on-switch.sh'"}]}]}}
+{"hooks":{"StopFailure":[{"matcher":"rate_limit","hooks":[{"type":"command","command":"/bin/sh '$state/on-limit.sh'"}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/bin/sh '$state/on-switch.sh'"}]}]$artifacts}}
 EOF
 }
 
@@ -874,6 +884,163 @@ cmd_go() {
   # From when only "go" rotated. Plain "carousel" does the same now; "go" is
   # kept so it still works, and rotates even with CAROUSEL_ROTATE=0.
   run_rotating "$(get_default)" "$@"
+}
+
+# --- artifact owner ------------------------------------------------------------
+# Artifacts belong to whichever account published them, so a session that has
+# rotated onto another profile scatters them across accounts. "carousel artifacts
+# <profile>" pins them to one: a PreToolUse hook catches every Artifact,
+# ArtifactComments and ArtifactData call made as any other profile and replays it
+# in a short print-mode claude running as the owner, then hands the result back
+# as the reason the original call was denied. The model reads that reason as the
+# tool's answer, so to the conversation it looks like the call simply went
+# through.
+#
+# Two things it can't carry over. Claude Code refuses to delete an artifact from
+# a print-mode run, since nobody is there to answer the confirmation, so a delete
+# is answered with how to do it as the owner instead. And a comment watch lives
+# in the session that holds it, so "watch" is left to run where it was asked.
+
+ARTIFACT_OWNER_FILE="$CAROUSEL_HOME/artifact-owner"
+ARTIFACT_DIR="$CAROUSEL_HOME/artifacts"
+
+get_artifact_owner() {
+  [ -f "$ARTIFACT_OWNER_FILE" ] || return 0
+  local n; n=$(tr -d '[:space:]' < "$ARTIFACT_OWNER_FILE" 2>/dev/null)
+  [ -n "$n" ] && profile_exists "$n" && printf '%s\n' "$n"
+}
+
+artifact_hook() {
+  # Prints the PreToolUse hook entry that routes artifact calls to the owner, or
+  # nothing when no owner is set. The proxy is rewritten on every launch so an
+  # updated carousel never runs an old copy of it.
+  local owner; owner=$(get_artifact_owner)
+  [ -n "$owner" ] || return 0
+  mkdir -p "$ARTIFACT_DIR" || return 0
+  local bin; bin=$(command -v "$CLAUDE_BIN" 2>/dev/null || printf '%s' "$CLAUDE_BIN")
+  cat > "$ARTIFACT_DIR/proxy.py" <<'EOF'
+# Run by Claude Code before every Artifact, ArtifactComments or ArtifactData call,
+# with the hook input on stdin. Written by carousel; edits are overwritten.
+import json, os, re, subprocess, sys, time
+
+owner, owner_dir, default_dir, claude = sys.argv[1:5]
+URLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "urls.json")
+KEEP = 30 * 86400
+TOOLS = "Artifact,ArtifactComments,ArtifactData,ToolSearch,Read"
+
+data = json.load(sys.stdin)
+here = os.path.realpath(os.environ.get("CLAUDE_CONFIG_DIR") or default_dir)
+# Already the owner, or this is the owner's own replay: let the call through.
+if os.environ.get("CAROUSEL_ARTIFACT_PROXY") or here == os.path.realpath(owner_dir):
+    sys.exit(0)
+
+def answer(reason):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "carousel: " + reason}}, ensure_ascii=False))
+    sys.exit(0)
+
+tool = data.get("tool_name") or "Artifact"
+args = dict(data.get("tool_input") or {})
+action = args.get("action") or ("publish" if tool == "Artifact" else "")
+
+if tool == "ArtifactComments" and action == "watch":
+    sys.exit(0)
+if tool == "Artifact" and action == "delete":
+    what = args.get("url", "the artifact")
+    if args.get("path"):
+        what += " (asset %s)" % args["path"]
+    answer("nothing was deleted. %s belongs to the '%s' carousel profile, and Claude Code "
+           "only deletes an artifact from a session where the user answers the confirmation. "
+           "Tell the user to delete it as that account: run `carousel %s`, then /artifacts "
+           "and press d on it, or use the artifact's own menu on claude.ai."
+           % (what, owner, owner))
+
+# Publishing the same file again should update the artifact it made, but each
+# replay is a fresh conversation, so the url has to be carried across here. It
+# is keyed by session as well as path: a new conversation publishing that path
+# makes a new artifact, the same as it would without carousel.
+try:
+    with open(URLS) as f:
+        urls = json.load(f)
+except Exception:
+    urls = {}
+key = None
+if tool == "Artifact" and action == "publish" and args.get("file_path") \
+        and not args.get("asset") and not args.get("type_url"):
+    path = os.path.join(data.get("cwd") or os.getcwd(), args["file_path"])
+    key = "%s:%s" % (data.get("session_id", ""), os.path.abspath(path))
+    if not args.get("url") and key in urls:
+        args["url"] = urls[key]["url"]
+
+prompt = (
+    "You are replaying a tool call the user made in another session, as their %s account. "
+    "Call the %s tool once with exactly these arguments, loading its schema with ToolSearch "
+    "first if it is deferred. For a publish that names a url, read that url with the Artifact "
+    "tool first: the local file already holds the intended new content and supersedes the live "
+    "version, so then publish the arguments unchanged, and once more unchanged if that is "
+    "refused as stale. Print the final tool result verbatim and nothing else.\n%s"
+    % (owner, tool, json.dumps(args, ensure_ascii=False)))
+env = dict(os.environ, CLAUDE_CODE_ARTIFACT="1", CAROUSEL_ARTIFACT_PROXY="1")
+if os.path.realpath(owner_dir) == os.path.realpath(default_dir):
+    env.pop("CLAUDE_CONFIG_DIR", None)
+else:
+    env["CLAUDE_CONFIG_DIR"] = owner_dir
+try:
+    r = subprocess.run([claude, "-p", prompt, "--allowedTools=" + TOOLS,
+                        "--no-session-persistence"],
+                       cwd=data.get("cwd") or None, env=env,
+                       capture_output=True, text=True, timeout=280)
+except Exception:
+    sys.exit(0)  # couldn't replay it: let the call run as this account instead
+out = (r.stdout or "").strip()
+if r.returncode != 0 or not out:
+    sys.exit(0)
+
+m = re.search(r"https://claude\.ai/(?:code/)?artifact/[A-Za-z0-9_-]+", out)
+if key and m:
+    now = time.time()
+    urls = {k: v for k, v in urls.items() if now - v.get("t", 0) < KEEP}
+    urls[key] = {"url": m.group(0), "t": now}
+    try:
+        with open(URLS + ".tmp", "w") as f:
+            json.dump(urls, f)
+        os.replace(URLS + ".tmp", URLS)
+    except Exception:
+        pass
+
+answer("this call ran as the '%s' profile, which owns this session's artifacts, so treat "
+       "what follows as the tool's result. To update an artifact it published, publish the "
+       "same file_path again.\n%s" % (owner, out))
+EOF
+  printf '{"matcher":"Artifact|ArtifactComments|ArtifactData","hooks":[{"type":"command","command":"python3 '\''%s'\'' '\''%s'\'' '\''%s'\'' '\''%s'\'' '\''%s'\''","timeout":300}]}' \
+    "$ARTIFACT_DIR/proxy.py" "$owner" "$(profile_dir "$owner")" "$DEFAULT_DIR" "$bin"
+}
+
+cmd_artifacts() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    local owner; owner=$(get_artifact_owner)
+    if [ -n "$owner" ]; then
+      printf 'artifacts are published as: %s%s%s (%s)\n' "$C_B" "$owner" "$C_0" "$(profile_email "$(profile_dir "$owner")")"
+      printf 'Turn it off with: carousel artifacts off\n'
+    else
+      printf 'artifacts are published as: whichever profile is running (off)\n'
+      printf 'Pin them to one account with: carousel artifacts <profile>\n'
+    fi
+    return 0
+  fi
+  if [ "$name" = "off" ]; then
+    rm -f "$ARTIFACT_OWNER_FILE"
+    printf '%s✓%s artifacts go back to being published as whichever profile is running\n' "$C_G" "$C_0"
+    return 0
+  fi
+  profile_exists "$name" || die "profile '$name' does not exist"
+  mkdir -p "$CAROUSEL_HOME"
+  printf '%s\n' "$name" > "$ARTIFACT_OWNER_FILE"
+  printf '%s✓%s artifacts are now published as %s%s%s, whichever profile is running\n' "$C_G" "$C_0" "$C_B" "$name" "$C_0"
+  printf '  It applies to sessions launched from now on.\n'
 }
 
 # --- shell alias management --------------------------------------------------
@@ -1048,6 +1215,12 @@ cmd_doctor() {
   else
     printf 'on a switch   : resumes at the prompt, sending nothing\n'
   fi
+  local owner; owner=$(get_artifact_owner)
+  if [ -n "$owner" ]; then
+    printf 'artifacts     : published as %s, whichever profile is running (carousel artifacts off to stop)\n' "$owner"
+  else
+    printf 'artifacts     : published as whichever profile is running (carousel artifacts <name> to pin)\n'
+  fi
   case "$OS" in
     Darwin) printf 'credentials   : macOS Keychain, per CLAUDE_CONFIG_DIR (handled automatically)\n' ;;
     *)      printf 'credentials   : a local file under each profile'\''s CLAUDE_CONFIG_DIR (handled automatically by Claude Code itself)\n' ;;
@@ -1086,6 +1259,7 @@ usage() {
   usage_row "$me whoami"          "$w" "show which profile the current shell is in"
   usage_row "$me order [names...]" "$w" "view/set the order a usage limit rotates through"
   usage_row "$me go [args...]"     "$w" "same as \"$me\", and rotates even with CAROUSEL_ROTATE=0"
+  usage_row "$me artifacts [name]" "$w" "publish artifacts as one profile, whichever is running"
   usage_row "$me sync [name]"     "$w" "re-link shared plugins/settings to ~/.claude"
   usage_row "$me rm <name>"       "$w" "remove a profile"
   usage_row "$me alias [name]"    "$w" "register/change a short shell alias (--remove to undo)"
@@ -1129,7 +1303,7 @@ EOF
 # Only the paths that actually launch Claude Code pay for an update check —
 # and only once a day. Everything else dispatches straight through.
 case "${1:-}" in
-  ls|list|add|login|use|switch|whoami|who|sync|rm|remove|order|doctor|alias|star|update|version|help) ;;
+  ls|list|add|login|use|switch|whoami|who|sync|rm|remove|order|artifacts|doctor|alias|star|update|version|help) ;;
   *) maybe_self_update "$@" ;;
 esac
 
@@ -1143,6 +1317,7 @@ case "${1:-}" in
   rm|remove)    shift; cmd_rm "$@" ;;
   order)        shift; cmd_order "$@" ;;
   go)           shift; cmd_go "$@" ;;
+  artifacts)    shift; cmd_artifacts "$@" ;;
   doctor)       shift; cmd_doctor "$@" ;;
   version)      printf 'claude-carousel %s\n' "$VERSION" ;;
   alias)        shift; cmd_alias "$@" ;;
