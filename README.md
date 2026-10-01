@@ -101,6 +101,7 @@ credential slot, so the sessions don't fight over a token.
 | `cc order [names…]` | View or set the order a usage limit rotates through |
 | `cc go [args…]` | Same as `cc`, and rotates even with `CAROUSEL_ROTATE=0` |
 | `/carousel:switch [name]` | Inside a session: carry on the conversation as another profile |
+| `cc artifacts [name\|off]` | Publish every artifact as one profile, whichever is running |
 | `cc sync [name]` | Re-link shared plugins/settings from `~/.claude` |
 | `cc rm <name>` | Delete a profile (symlinks unlinked; originals untouched) |
 | `cc alias [name]` | Register or change a short shell alias (`--remove` to undo) |
@@ -158,6 +159,8 @@ carousel is essentially a small amount of bookkeeping around that one environmen
 ├── default                            ← name of the default profile
 ├── order                              ← rotation order for `go`
 ├── alias                              ← the shell alias you registered
+├── artifact-owner                     ← the profile `cc artifacts` pins artifacts to
+├── artifacts/                         ← the artifact proxy, and the urls it carries over
 └── profiles/
     ├── work.json -> work/.claude.json   ← status lines (claude-hud) read the account here
     └── work/
@@ -248,6 +251,39 @@ Caveats:
    including a new profile's first run under `carousel login`. As in Claude Code itself, a folder
    above a git repository doesn't count for the folders inside it.
 4. **Claude Code is stopped, not exited**, so hooks that run at session end may be cut short.
+
+## Keeping artifacts on one account
+
+An artifact belongs to the account that published it, so a session that has rotated through
+three profiles leaves its artifacts spread across three accounts. Pin them to one:
+
+```bash
+cc artifacts default    # publish as default, whichever profile is running
+cc artifacts            # show which profile that is
+cc artifacts off        # back to publishing as whichever profile is running
+```
+
+From then on, every session carousel launches registers a `PreToolUse` hook on the
+`Artifact`, `ArtifactComments` and `ArtifactData` tools. A call made as any other profile is
+replayed in a short `claude -p` running as the owner, and its result comes back to the
+session as the hook's answer, so creating, updating, reading, pinning, commenting and the
+artifact database all happen as that one account. Publishing the same file again in the
+same conversation updates the artifact it made, as it would without carousel. A call made
+as the owner itself goes straight through.
+
+Caveats:
+
+1. **Each call takes 20–40 seconds** and a little of the owner's usage, since it is a turn of
+   its own. If the replay fails — the owner has hit a limit, say — the call runs as the
+   current profile instead.
+2. **Deleting is left to you.** Claude Code won't delete an artifact from a `-p` run, since
+   nobody is there to confirm it, so a delete is answered with how to do it: `cc <owner>`,
+   then `/artifacts` and `d`, or the artifact's menu on claude.ai.
+3. **Comment watches stay in the session that asked**, since a watch can't outlive the
+   replay. Comments sent to Claude on an owner's artifact won't wake a session running as
+   another profile.
+4. **It is per machine.** The setting lives in `~/.claude-carousel`, so run `cc artifacts`
+   once on each machine, with the owner profile logged into the same account there.
 
 ## Bypass mode
 

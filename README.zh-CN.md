@@ -99,6 +99,7 @@ cc order default work  # 触及上限时的轮换顺序
 | `cc order [名称…]` | 查看或设置触及上限时的轮换顺序 |
 | `cc go [参数…]` | 与 `cc` 相同，即使 `CAROUSEL_ROTATE=0` 也会轮换 |
 | `/carousel:switch [名称]` | 在会话中：用另一个 profile 继续当前对话 |
+| `cc artifacts [名称\|off]` | 无论运行哪个 profile，artifact 都以同一个 profile 发布 |
 | `cc sync [名称]` | 重新链接来自 `~/.claude` 的共享插件与设置 |
 | `cc rm <名称>` | 删除配置（只解除软链接，原文件不动） |
 | `cc alias [名称]` | 注册或修改简短的 shell 别名（`--remove` 撤销） |
@@ -152,6 +153,8 @@ carousel 本质上就是围绕这一个环境变量做的少量管理工作：
 ├── default                            ← 默认配置的名称
 ├── order                              ← `go` 的轮换顺序
 ├── alias                              ← 已注册的 shell 别名
+├── artifact-owner                     ← `cc artifacts` 指定的 artifact 所属 profile
+├── artifacts/                         ← artifact 代理，以及它沿用的 URL 记录
 └── profiles/
     ├── work.json -> work/.claude.json   ← 状态栏（claude-hud）从这里读取账号
     └── work/
@@ -229,6 +232,35 @@ hook，所以普通的 `claude` 会话里没有它。指定不存在的 profile 
    （或其上级文件夹），在 carousel 启动的 profile 中也会标记为已信任，用 `carousel login` 首次启动
    新 profile 时也一样。与 Claude Code 本身一致，git 仓库之上的文件夹的信任不适用于仓库内的文件夹。
 4. **Claude Code 是被停止而不是正常退出**，所以会话结束时运行的 hook 可能无法执行完。
+
+## 把 artifact 集中到一个账号
+
+artifact 归发布它的账号所有，所以一个轮换过三个 profile 的会话，会把 artifact 分散到三个账号里。
+要固定到一个账号：
+
+```bash
+cc artifacts default    # 无论运行哪个 profile，都以 default 发布
+cc artifacts            # 查看当前以哪个 profile 发布
+cc artifacts off        # 恢复为以正在运行的 profile 发布
+```
+
+之后 carousel 启动的每个会话，都会在 `Artifact`、`ArtifactComments`、`ArtifactData` 工具上注册
+一个 `PreToolUse` hook。以其他 profile 发起的调用，会在一个以所属 profile 运行的简短 `claude -p`
+中重放，结果作为 hook 的回答返回会话。因此创建、更新、读取、置顶、评论和 artifact 数据库都由那一个
+账号完成。在同一个对话中再次发布同一个文件，会像没有 carousel 时一样更新它创建的 artifact。以所属
+profile 本身发起的调用会直接通过。
+
+注意事项：
+
+1. **每次调用需要 20–40 秒**，并消耗所属账号少量用量，因为它要单独跑一轮。如果重放失败（例如所属
+   账号已达上限），调用会改以当前 profile 执行。
+2. **删除需要你自己来。** Claude Code 不会在没人能确认的 `-p` 运行中删除 artifact，所以删除请求会
+   得到操作说明：运行 `cc <所属 profile>`，然后在 `/artifacts` 中按 `d`，或在 claude.ai 的
+   artifact 菜单中删除。
+3. **评论 watch 留在发起请求的会话中**，因为 watch 无法比重放活得更久。发给 Claude 的、所属账号
+   artifact 上的评论，不会唤醒以其他 profile 运行的会话。
+4. **按机器设置。** 设置保存在 `~/.claude-carousel` 中，所以每台机器都要运行一次 `cc artifacts`，
+   并且该机器上的所属 profile 要登录同一个账号。
 
 ## bypass 模式
 
